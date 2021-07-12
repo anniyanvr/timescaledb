@@ -184,8 +184,8 @@ ts_partitioning_info_create(const char *schema, const char *partfunc, const char
 				 errmsg("partitioning function information cannot be null")));
 
 	pinfo = palloc0(sizeof(PartitioningInfo));
-	StrNCpy(pinfo->partfunc.name, partfunc, NAMEDATALEN);
-	StrNCpy(pinfo->column, partcol, NAMEDATALEN);
+	strlcpy(pinfo->partfunc.name, partfunc, NAMEDATALEN);
+	strlcpy(pinfo->column, partcol, NAMEDATALEN);
 	pinfo->column_attnum = get_attnum(relid, pinfo->column);
 	pinfo->dimtype = dimtype;
 
@@ -193,7 +193,7 @@ ts_partitioning_info_create(const char *schema, const char *partfunc, const char
 	if (pinfo->column_attnum == InvalidAttrNumber)
 		return NULL;
 
-	StrNCpy(pinfo->partfunc.schema, schema, NAMEDATALEN);
+	strlcpy(pinfo->partfunc.schema, schema, NAMEDATALEN);
 
 	/* Lookup the type cache entry to access the hash function for the type */
 	columntype = get_atttype(relid, pinfo->column_attnum);
@@ -448,16 +448,12 @@ ts_get_partition_hash(PG_FUNCTION_ARGS)
 	if (pfc->tce->hash_proc == InvalidOid)
 		elog(ERROR, "could not find hash function for type %u", pfc->argtype);
 
-#if PG12_LT
-	collation = InvalidOid;
-#else
 	/* use the supplied collation, if it exists, otherwise use the default for
 	 * the type
 	 */
 	collation = PG_GET_COLLATION();
 	if (!OidIsValid(collation))
 		collation = pfc->tce->typcollation;
-#endif
 
 	hash = FunctionCall1Coll(&pfc->tce->hash_proc_finfo, collation, arg);
 

@@ -35,6 +35,7 @@ typedef struct JsonbParseState JsonbParseState;
 typedef struct Hypertable Hypertable;
 typedef struct Chunk Chunk;
 typedef struct CopyChunkState CopyChunkState;
+typedef struct CompressSingleRowState CompressSingleRowState;
 
 typedef struct CrossModuleFunctions
 {
@@ -43,6 +44,7 @@ typedef struct CrossModuleFunctions
 	PGFunction policy_compression_add;
 	PGFunction policy_compression_proc;
 	PGFunction policy_compression_remove;
+	PGFunction policy_recompression_proc;
 	PGFunction policy_refresh_cagg_add;
 	PGFunction policy_refresh_cagg_proc;
 	PGFunction policy_refresh_cagg_remove;
@@ -102,6 +104,7 @@ typedef struct CrossModuleFunctions
 	void (*process_rename_cmd)(Hypertable *ht, const RenameStmt *stmt);
 	PGFunction compress_chunk;
 	PGFunction decompress_chunk;
+	PGFunction recompress_chunk;
 	/* The compression functions below are not installed in SQL as part of create extension;
 	 *  They are installed and tested during testing scripts. They are exposed in cross-module
 	 *  functions because they may be very useful for debugging customer problems if the sql
@@ -118,28 +121,28 @@ typedef struct CrossModuleFunctions
 	PGFunction array_compressor_append;
 	PGFunction array_compressor_finish;
 
-	Datum (*data_node_add)(PG_FUNCTION_ARGS);
-	Datum (*data_node_delete)(PG_FUNCTION_ARGS);
-	Datum (*data_node_attach)(PG_FUNCTION_ARGS);
-	Datum (*data_node_ping)(PG_FUNCTION_ARGS);
-	Datum (*data_node_detach)(PG_FUNCTION_ARGS);
-	Datum (*data_node_allow_new_chunks)(PG_FUNCTION_ARGS);
-	Datum (*data_node_block_new_chunks)(PG_FUNCTION_ARGS);
+	PGFunction data_node_add;
+	PGFunction data_node_delete;
+	PGFunction data_node_attach;
+	PGFunction data_node_ping;
+	PGFunction data_node_detach;
+	PGFunction data_node_allow_new_chunks;
+	PGFunction data_node_block_new_chunks;
 
-	Datum (*chunk_set_default_data_node)(PG_FUNCTION_ARGS);
-	Datum (*create_chunk)(PG_FUNCTION_ARGS);
-	Datum (*show_chunk)(PG_FUNCTION_ARGS);
+	PGFunction chunk_set_default_data_node;
+	PGFunction create_chunk;
+	PGFunction show_chunk;
 	List *(*get_and_validate_data_node_list)(ArrayType *nodearr);
 	void (*hypertable_make_distributed)(Hypertable *ht, List *data_node_names);
-	Datum (*timescaledb_fdw_handler)(PG_FUNCTION_ARGS);
-	Datum (*timescaledb_fdw_validator)(PG_FUNCTION_ARGS);
+	PGFunction timescaledb_fdw_handler;
+	PGFunction timescaledb_fdw_validator;
 	void (*cache_syscache_invalidate)(Datum arg, int cacheid, uint32 hashvalue);
 	PGFunction remote_txn_id_in;
 	PGFunction remote_txn_id_out;
 	PGFunction remote_txn_heal_data_node;
 	PGFunction remote_connection_cache_show;
-	void (*create_chunk_on_data_nodes)(Chunk *chunk, Hypertable *ht);
-	Path *(*data_node_dispatch_path_create)(PlannerInfo *root, ModifyTablePath *mtpath,
+	void (*create_chunk_on_data_nodes)(const Chunk *chunk, const Hypertable *ht);
+	Path *(*distributed_insert_path_create)(PlannerInfo *root, ModifyTablePath *mtpath,
 											Index hypertable_rti, int subpath_index);
 	uint64 (*distributed_copy)(const CopyStmt *stmt, CopyChunkState *ccstate, List *attnums);
 	bool (*set_distributed_id)(Datum id);
@@ -158,6 +161,10 @@ typedef struct CrossModuleFunctions
 	PGFunction chunk_get_colstats;
 	PGFunction hypertable_distributed_set_replication_factor;
 	void (*update_compressed_chunk_relstats)(Oid uncompressed_relid, Oid compressed_relid);
+	CompressSingleRowState *(*compress_row_init)(int srcht_id, Relation in_rel, Relation out_rel);
+	TupleTableSlot *(*compress_row_exec)(CompressSingleRowState *cr, TupleTableSlot *slot);
+	void (*compress_row_end)(CompressSingleRowState *cr);
+	void (*compress_row_destroy)(CompressSingleRowState *cr);
 } CrossModuleFunctions;
 
 extern TSDLLEXPORT CrossModuleFunctions *ts_cm_functions;

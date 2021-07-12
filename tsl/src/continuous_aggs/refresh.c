@@ -253,7 +253,7 @@ continuous_agg_refresh_execute(const CaggRefreshState *refresh,
 		.start = 0,
 		.end = 0,
 	};
-	Dimension *time_dim = hyperspace_get_open_dimension(refresh->cagg_ht->space, 0);
+	const Dimension *time_dim = hyperspace_get_open_dimension(refresh->cagg_ht->space, 0);
 
 	Assert(time_dim != NULL);
 
@@ -262,7 +262,6 @@ continuous_agg_refresh_execute(const CaggRefreshState *refresh,
 										  &time_dim->fd.column_name,
 										  *bucketed_refresh_window,
 										  unused_invalidation_range,
-										  refresh->cagg.data.bucket_width,
 										  chunk_id);
 }
 
@@ -382,7 +381,7 @@ continuous_agg_refresh_with_window(const ContinuousAgg *cagg,
 	if (tuplestore_tuple_count(invalidations->tupstore) > materialization_per_refresh_window())
 		do_merged_refresh = true;
 
-	slot = MakeSingleTupleTableSlotCompat(invalidations->tupdesc, &TTSOpsMinimalTuple);
+	slot = MakeSingleTupleTableSlot(invalidations->tupdesc, &TTSOpsMinimalTuple);
 
 	while (tuplestore_gettupleslot(invalidations->tupstore,
 								   true /* forward */,
@@ -406,8 +405,9 @@ continuous_agg_refresh_with_window(const ContinuousAgg *cagg,
 			.end = ts_time_saturating_add(DatumGetInt64(end), 1, refresh_window->type),
 		};
 
+		int64 max_bucket_width = ts_continuous_agg_max_bucket_width(cagg);
 		InternalTimeRange bucketed_refresh_window =
-			compute_circumscribed_bucketed_refresh_window(&invalidation, cagg->data.bucket_width);
+			compute_circumscribed_bucketed_refresh_window(&invalidation, max_bucket_width);
 
 		if (do_merged_refresh)
 		{
@@ -572,6 +572,7 @@ continuous_agg_refresh_internal(const ContinuousAgg *cagg,
 	InternalTimeRange refresh_window;
 	int64 computed_invalidation_threshold;
 	int64 invalidation_threshold;
+	int64 max_bucket_width;
 
 	/* Like regular materialized views, require owner to refresh. */
 	if (!pg_class_ownercheck(cagg->relid, GetUserId()))
@@ -590,8 +591,9 @@ continuous_agg_refresh_internal(const ContinuousAgg *cagg,
 	 * prevent transaction blocks.  */
 	PreventInTransactionBlock(true, REFRESH_FUNCTION_NAME);
 
+	max_bucket_width = ts_continuous_agg_max_bucket_width(cagg);
 	refresh_window =
-		compute_inscribed_bucketed_refresh_window(refresh_window_arg, cagg->data.bucket_width);
+		compute_inscribed_bucketed_refresh_window(refresh_window_arg, max_bucket_width);
 
 	if (refresh_window.start >= refresh_window.end)
 		ereport(ERROR,

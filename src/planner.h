@@ -9,15 +9,9 @@
 #include <postgres.h>
 #include <nodes/pg_list.h>
 #include <nodes/parsenodes.h>
-
-#include "compat.h"
-#include "export.h"
-
-#if PG12_GE
 #include <nodes/pathnodes.h>
-#else
-#include <nodes/relation.h>
-#endif
+
+#include "export.h"
 
 typedef struct TsFdwRelationInfo TsFdwRelationInfo;
 typedef struct TimescaleDBPrivate
@@ -44,9 +38,14 @@ ts_create_private_reloptinfo(RelOptInfo *rel)
 }
 
 static inline TimescaleDBPrivate *
-ts_get_private_reloptinfo(const RelOptInfo *rel)
+ts_get_private_reloptinfo(RelOptInfo *rel)
 {
-	return rel->fdw_private;
+	/* If rel->fdw_private is not set up here it means the rel got missclassified
+	 * and did not get expanded by our code but by postgres native code.
+	 * This is not a problem by itself, but probably an oversight on our part.
+	 */
+	Assert(rel->fdw_private);
+	return rel->fdw_private ? rel->fdw_private : ts_create_private_reloptinfo(rel);
 }
 
 /*

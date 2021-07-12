@@ -16,6 +16,7 @@
 #include <nodes/makefuncs.h>
 #include <nodes/pg_list.h>
 #include <nodes/parsenodes.h>
+#include <parser/parse_func.h>
 #include <storage/lmgr.h>
 #include <trigger.h>
 #include <utils/builtins.h>
@@ -38,9 +39,6 @@
 #include "scanner.h"
 #include "scan_iterator.h"
 #include "compression_chunk_size.h"
-
-#define CHUNK_DML_BLOCKER_TRIGGER "chunk_dml_blocker"
-#define CHUNK_DML_BLOCKER_NAME "compressed_chunk_insert_blocker"
 
 typedef struct CompressChunkCxt
 {
@@ -125,58 +123,6 @@ compression_chunk_size_catalog_insert(int32 src_chunk_id, ChunkSize *src_size,
 }
 
 static void
-chunk_dml_blocker_trigger_add(Oid relid)
-{
-	ObjectAddress objaddr;
-	char *relname = get_rel_name(relid);
-	Oid schemaid = get_rel_namespace(relid);
-	char *schema = get_namespace_name(schemaid);
-
-	/* stmt triggers are blocked on hypertable chunks */
-	CreateTrigStmt stmt = {
-		.type = T_CreateTrigStmt,
-		.row = true,
-		.timing = TRIGGER_TYPE_BEFORE,
-		.trigname = CHUNK_DML_BLOCKER_NAME,
-		.relation = makeRangeVar(schema, relname, -1),
-		.funcname =
-			list_make2(makeString(INTERNAL_SCHEMA_NAME), makeString(CHUNK_DML_BLOCKER_TRIGGER)),
-		.args = NIL,
-		.events = TRIGGER_TYPE_INSERT,
-	};
-	objaddr = CreateTrigger(&stmt,
-							NULL,
-							relid,
-							InvalidOid,
-							InvalidOid,
-							InvalidOid,
-							InvalidOid,
-							InvalidOid,
-							NULL,
-							false,
-							false);
-
-	if (!OidIsValid(objaddr.objectId))
-		elog(ERROR, "could not create DML blocker trigger");
-
-	return;
-}
-
-static void
-chunk_dml_trigger_drop(Oid relid)
-{
-	if (OidIsValid(relid))
-	{
-		ObjectAddress objaddr = {
-			.classId = TriggerRelationId,
-			.objectId = get_trigger_oid(relid, CHUNK_DML_BLOCKER_NAME, true),
-		};
-		if (OidIsValid(objaddr.objectId))
-			performDeletion(&objaddr, DROP_RESTRICT, 0);
-	}
-}
-
-static void
 compresschunkcxt_init(CompressChunkCxt *cxt, Cache *hcache, Oid hypertable_relid, Oid chunk_relid)
 {
 	Hypertable *srcht = ts_hypertable_cache_get_entry(hcache, hypertable_relid, CACHE_FLAG_NONE);
@@ -229,20 +175,11 @@ preserve_uncompressed_chunk_stats(Oid chunk_relid)
 	VacuumStmt vs = {
 		.type = T_VacuumStmt,
 		.rels = list_make1(&vr),
-#if PG12_GE
 		.is_vacuumcmd = false,
 		.options = NIL,
-#else
-		.options = VACOPT_ANALYZE,
-#endif
 	};
 
-#if PG12_GE
 	ExecVacuum(NULL, &vs, true);
-#else
-	ExecVacuum(&vs, true);
-	CommandCounterIncrement();
-#endif
 	AlterTableInternal(chunk_relid, list_make1(&at_cmd), false);
 }
 
@@ -335,7 +272,6 @@ compress_chunk_impl(Oid hypertable_relid, Oid chunk_relid)
 	 * directly on the hypertable or chunks.
 	 */
 	ts_chunk_drop_fks(cxt.srcht_chunk);
-	chunk_dml_blocker_trigger_add(cxt.srcht_chunk->table_id);
 	after_size = compute_chunk_size(compress_ht_chunk->table_id);
 	compression_chunk_size_catalog_insert(cxt.srcht_chunk->fd.id,
 										  &before_size,
@@ -344,7 +280,7 @@ compress_chunk_impl(Oid hypertable_relid, Oid chunk_relid)
 										  cstat.rowcnt_pre_compression,
 										  cstat.rowcnt_post_compression);
 
-	ts_chunk_set_compressed_chunk(cxt.srcht_chunk, compress_ht_chunk->fd.id, false);
+	ts_chunk_set_compressed_chunk(cxt.srcht_chunk, compress_ht_chunk->fd.id);
 	ts_cache_release(hcache);
 }
 
@@ -398,12 +334,11 @@ decompress_chunk_impl(Oid uncompressed_hypertable_relid, Oid uncompressed_chunk_
 					AccessShareLock);
 	LockRelationOid(catalog_get_table_id(ts_catalog_get(), CHUNK), RowExclusiveLock);
 
-	chunk_dml_trigger_drop(uncompressed_chunk->table_id);
 	decompress_chunk(compressed_chunk->table_id, uncompressed_chunk->table_id);
 	/* Recreate FK constraints, since they were dropped during compression. */
 	ts_chunk_create_fks(uncompressed_chunk);
 	ts_compression_chunk_size_delete(uncompressed_chunk->fd.id);
-	ts_chunk_set_compressed_chunk(uncompressed_chunk, INVALID_CHUNK_ID, true);
+	ts_chunk_clear_compressed_chunk(uncompressed_chunk);
 	ts_chunk_drop(compressed_chunk, DROP_RESTRICT, -1);
 	/* reenable autovacuum if necessary */
 	restore_autovacuum_on_decompress(uncompressed_hypertable_relid, uncompressed_chunk_relid);
@@ -412,7 +347,12 @@ decompress_chunk_impl(Oid uncompressed_hypertable_relid, Oid uncompressed_chunk_
 	return true;
 }
 
-bool
+/*
+ * Set if_not_compressed to true for idempotent operation. Aborts transaction if the chunk is
+ * already compressed, unless it is running in idempotent mode.
+ */
+
+void
 tsl_compress_chunk_wrapper(Chunk *chunk, bool if_not_compressed)
 {
 	if (chunk->fd.compressed_chunk_id != INVALID_CHUNK_ID)
@@ -420,11 +360,10 @@ tsl_compress_chunk_wrapper(Chunk *chunk, bool if_not_compressed)
 		ereport((if_not_compressed ? NOTICE : ERROR),
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("chunk \"%s\" is already compressed", get_rel_name(chunk->table_id))));
-		return false;
+		return;
 	}
 
 	compress_chunk_impl(chunk->hypertable_relid, chunk->table_id);
-	return true;
 }
 
 /*
@@ -504,14 +443,22 @@ tsl_compress_chunk(PG_FUNCTION_ARGS)
 
 	if (chunk->relkind == RELKIND_FOREIGN_TABLE)
 	{
+		/* chunks of distributed hypertables are foreign tables */
 		if (!compress_remote_chunk(fcinfo, chunk, if_not_compressed))
 			PG_RETURN_NULL();
 
-		PG_RETURN_OID(uncompressed_chunk_id);
+		/*
+		 * Updating the chunk compression status of the Access Node AFTER executing remote
+		 * compression. In the event of failure, the compressed status will NOT be set. The
+		 * distributed compression policy will attempt to compress again, which is idempotent, thus
+		 * the metadata are eventually consistent.
+		 */
+		ts_chunk_set_compressed_chunk(chunk, INVALID_CHUNK_ID);
 	}
-
-	if (!tsl_compress_chunk_wrapper(chunk, if_not_compressed))
-		PG_RETURN_NULL();
+	else
+	{
+		tsl_compress_chunk_wrapper(chunk, if_not_compressed);
+	}
 
 	PG_RETURN_OID(uncompressed_chunk_id);
 }
@@ -528,6 +475,19 @@ tsl_decompress_chunk(PG_FUNCTION_ARGS)
 
 	if (uncompressed_chunk->relkind == RELKIND_FOREIGN_TABLE)
 	{
+		/*
+		 * Updating the chunk compression status of the Access Node BEFORE executing remote
+		 * decompression. In the event of failure, the compressed status will be cleared. The
+		 * distributed compression policy will attempt to compress again, which is idempotent, thus
+		 * the metadata are eventually consistent.
+		 * If CHUNK_STATUS_COMPRESSED is cleared, then it is probable that a remote compress_chunk()
+		 * has not taken place, but not certain. For this above reason, this flag should not be
+		 * assumed to be consistent (when it is cleared) for Access-Nodes. When used in distributed
+		 * hypertables one should take advantage of the idempotent properties of remote
+		 * compress_chunk() and distributed compression policy to make progress.
+		 */
+		ts_chunk_clear_compressed_chunk(uncompressed_chunk);
+
 		if (!decompress_remote_chunk(fcinfo, uncompressed_chunk, if_compressed))
 			PG_RETURN_NULL();
 
@@ -540,4 +500,120 @@ tsl_decompress_chunk(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 
 	PG_RETURN_OID(uncompressed_chunk_id);
+}
+
+/* setup FunctionCallInfo for compress_chunk/decompress_chunk
+ * alloc memory for decompfn_fcinfo and init it.
+ */
+static void
+get_compression_fcinfo(char *fname, FmgrInfo *decompfn, FunctionCallInfo *decompfn_fcinfo,
+					   FunctionCallInfo orig_fcinfo)
+{
+	/* compress_chunk, decompress_chunk have the same args */
+	Oid argtyp[] = { REGCLASSOID, BOOLOID };
+	fmNodePtr cxt =
+		orig_fcinfo->context; /* pass in the context from the current FunctionCallInfo */
+
+	Oid decomp_func_oid =
+		LookupFuncName(list_make1(makeString(fname)), lengthof(argtyp), argtyp, false);
+
+	fmgr_info(decomp_func_oid, decompfn);
+	*decompfn_fcinfo = HEAP_FCINFO(2);
+	InitFunctionCallInfoData(**decompfn_fcinfo,
+							 decompfn,
+							 2,
+							 InvalidOid, /* collation */
+							 cxt,
+							 NULL);
+	FC_ARG(*decompfn_fcinfo, 0) = FC_ARG(orig_fcinfo, 0);
+	FC_NULL(*decompfn_fcinfo, 0) = FC_NULL(orig_fcinfo, 0);
+	FC_ARG(*decompfn_fcinfo, 1) = FC_ARG(orig_fcinfo, 1);
+	FC_NULL(*decompfn_fcinfo, 1) = FC_NULL(orig_fcinfo, 1);
+}
+
+static Datum
+tsl_recompress_remote_chunk(Chunk *uncompressed_chunk, FunctionCallInfo fcinfo, bool if_compressed)
+{
+	FmgrInfo decompfn;
+	FmgrInfo compfn;
+	FunctionCallInfo decompfn_fcinfo;
+	FunctionCallInfo compfn_fcinfo;
+	get_compression_fcinfo(DECOMPRESS_CHUNK_FUNCNAME, &decompfn, &decompfn_fcinfo, fcinfo);
+
+	FunctionCallInvoke(decompfn_fcinfo);
+	if (decompfn_fcinfo->isnull)
+	{
+		ereport((if_compressed ? NOTICE : ERROR),
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("decompression failed for chunk \"%s\"",
+						get_rel_name(uncompressed_chunk->table_id)),
+				 errdetail("The compression status for the chunk is %d",
+						   uncompressed_chunk->fd.status)));
+
+		PG_RETURN_NULL();
+	}
+	get_compression_fcinfo(COMPRESS_CHUNK_FUNCNAME, &compfn, &compfn_fcinfo, fcinfo);
+	Datum compoid = FunctionCallInvoke(compfn_fcinfo);
+	if (compfn_fcinfo->isnull)
+	{
+		ereport((if_compressed ? NOTICE : ERROR),
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("compression failed for chunk \"%s\"",
+						get_rel_name(uncompressed_chunk->table_id)),
+				 errdetail("The compression status for the chunk is %d",
+						   uncompressed_chunk->fd.status)));
+		PG_RETURN_NULL();
+	}
+	return compoid;
+}
+
+bool
+tsl_recompress_chunk_wrapper(Chunk *uncompressed_chunk)
+{
+	Oid uncompressed_chunk_relid = uncompressed_chunk->table_id;
+	if (ts_chunk_is_unordered(uncompressed_chunk))
+	{
+		if (!decompress_chunk_impl(uncompressed_chunk->hypertable_relid,
+								   uncompressed_chunk_relid,
+								   false))
+			return false;
+	}
+	Chunk *chunk = ts_chunk_get_by_relid(uncompressed_chunk_relid, true);
+	Assert(!ts_chunk_is_compressed(chunk));
+	tsl_compress_chunk_wrapper(chunk, false);
+	return true;
+}
+
+Datum
+tsl_recompress_chunk(PG_FUNCTION_ARGS)
+{
+	Oid uncompressed_chunk_id = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
+	bool if_compressed = PG_ARGISNULL(1) ? false : PG_GETARG_BOOL(1);
+	Chunk *uncompressed_chunk =
+		ts_chunk_get_by_relid(uncompressed_chunk_id, true /* fail_if_not_found */);
+	if (!ts_chunk_is_unordered(uncompressed_chunk))
+	{
+		if (!ts_chunk_is_compressed(uncompressed_chunk))
+		{
+			ereport((if_compressed ? NOTICE : ERROR),
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("call compress_chunk instead of recompress_chunk")));
+			PG_RETURN_NULL();
+		}
+		else
+		{
+			ereport((if_compressed ? NOTICE : ERROR),
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("nothing to recompress in chunk \"%s\" ",
+							get_rel_name(uncompressed_chunk->table_id))));
+			PG_RETURN_NULL();
+		}
+	}
+	if (uncompressed_chunk->relkind == RELKIND_FOREIGN_TABLE)
+		return tsl_recompress_remote_chunk(uncompressed_chunk, fcinfo, if_compressed);
+	else
+	{
+		tsl_recompress_chunk_wrapper(uncompressed_chunk);
+		PG_RETURN_OID(uncompressed_chunk_id);
+	}
 }

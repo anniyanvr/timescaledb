@@ -118,11 +118,11 @@ ts_hypertable_permissions_check_by_id(int32 hypertable_id)
 }
 
 static Oid
-get_chunk_sizing_func_oid(FormData_hypertable *fd)
+get_chunk_sizing_func_oid(const FormData_hypertable *fd)
 {
 	Oid argtype[] = { INT4OID, INT8OID, INT8OID };
-	return LookupFuncName(list_make2(makeString(NameStr(fd->chunk_sizing_func_schema)),
-									 makeString(NameStr(fd->chunk_sizing_func_name))),
+	return LookupFuncName(list_make2(makeString((char *) NameStr(fd->chunk_sizing_func_schema)),
+									 makeString((char *) NameStr(fd->chunk_sizing_func_name))),
 						  sizeof(argtype) / sizeof(argtype[0]),
 						  argtype,
 						  false);
@@ -317,7 +317,7 @@ ts_hypertable_get_time_type(PG_FUNCTION_ARGS)
 	int32 hypertable_id = PG_GETARG_INT32(0);
 	Cache *hcache = ts_hypertable_cache_pin();
 	Hypertable *ht = ts_hypertable_cache_get_entry_by_id(hcache, hypertable_id);
-	Dimension *time_dimension;
+	const Dimension *time_dimension;
 	Oid time_type;
 	if (ht == NULL)
 		PG_RETURN_NULL();
@@ -345,7 +345,7 @@ chunk_store_entry_free(void *cse)
 }
 
 static bool
-hypertable_is_compressed_or_materialization(Hypertable *ht)
+hypertable_is_compressed_or_materialization(const Hypertable *ht)
 {
 	ContinuousAggHypertableStatus status = ts_continuous_agg_hypertable_status(ht->fd.id);
 	return (TS_HYPERTABLE_IS_INTERNAL_COMPRESSION_TABLE(ht) ||
@@ -353,7 +353,7 @@ hypertable_is_compressed_or_materialization(Hypertable *ht)
 }
 
 static ScanFilterResult
-hypertable_filter_exclude_compressed_and_materialization(TupleInfo *ti, void *data)
+hypertable_filter_exclude_compressed_and_materialization(const TupleInfo *ti, void *data)
 {
 	Hypertable *ht = ts_hypertable_from_tupleinfo(ti);
 
@@ -386,7 +386,7 @@ hypertable_scan_limit_internal(ScanKeyData *scankey, int num_scankeys, int index
 
 /* Is a user hypertable without compression or continuous aggs */
 static bool
-hypertable_is_user_table(Hypertable *ht)
+hypertable_is_user_table(const Hypertable *ht)
 {
 	ContinuousAggHypertableStatus status = ts_continuous_agg_hypertable_status(ht->fd.id);
 
@@ -494,7 +494,7 @@ hypertable_tuple_update(TupleInfo *ti, void *data)
 
 	if (OidIsValid(ht->chunk_sizing_func))
 	{
-		Dimension *dim = ts_hyperspace_get_dimension(ht->space, DIMENSION_TYPE_OPEN, 0);
+		const Dimension *dim = ts_hyperspace_get_dimension(ht->space, DIMENSION_TYPE_OPEN, 0);
 		ChunkSizingInfo info = {
 			.table_relid = ht->main_table_relid,
 			.colname = dim == NULL ? NULL : NameStr(dim->fd.column_name),
@@ -547,10 +547,14 @@ ts_hypertable_scan_with_memory_context(const char *schema, const char *table,
 									   bool tuplock, MemoryContext mctx)
 {
 	ScanKeyData scankey[2];
-	NameData schema_name, table_name;
+	NameData schema_name = { 0 };
+	NameData table_name = { 0 };
 
-	namestrcpy(&schema_name, schema);
-	namestrcpy(&table_name, table);
+	if (schema)
+		namestrcpy(&schema_name, schema);
+
+	if (table)
+		namestrcpy(&table_name, table);
 
 	/* Perform an index scan on schema and table. */
 	ScanKeyInit(&scankey[0],
@@ -577,7 +581,7 @@ ts_hypertable_scan_with_memory_context(const char *schema, const char *table,
 }
 
 TSDLLEXPORT ObjectAddress
-ts_hypertable_create_trigger(Hypertable *ht, CreateTrigStmt *stmt, const char *query)
+ts_hypertable_create_trigger(const Hypertable *ht, CreateTrigStmt *stmt, const char *query)
 {
 	ObjectAddress root_trigger_addr;
 	List *chunks;
@@ -587,11 +591,6 @@ ts_hypertable_create_trigger(Hypertable *ht, CreateTrigStmt *stmt, const char *q
 	Oid owner;
 
 	Assert(ht != NULL);
-
-	if (stmt->transitionRels != NIL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("hypertables do not support transition tables in triggers")));
 
 	/* create the trigger on the root table */
 	/* ACL permissions checks happen within this call */
@@ -872,9 +871,7 @@ ts_hypertable_lock_tuple_simple(Oid table_relid)
 			/* successfully locked */
 			return true;
 
-#if PG12_GE
 		case TM_Deleted:
-#endif
 		case TM_Updated:
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
@@ -1111,7 +1108,7 @@ ts_hypertable_get_by_id(int32 hypertable_id)
 }
 
 static ChunkStoreEntry *
-hypertable_chunk_store_add(Hypertable *h, Chunk *chunk)
+hypertable_chunk_store_add(const Hypertable *h, const Chunk *chunk)
 {
 	ChunkStoreEntry *cse;
 	MemoryContext old_mcxt, chunk_mcxt;
@@ -1132,7 +1129,8 @@ hypertable_chunk_store_add(Hypertable *h, Chunk *chunk)
 }
 
 static inline Chunk *
-hypertable_get_chunk(Hypertable *h, Point *point, bool create_if_not_exists, bool lock_chunk_slices)
+hypertable_get_chunk(const Hypertable *h, const Point *point, bool create_if_not_exists,
+					 bool lock_chunk_slices)
 {
 	Chunk *chunk;
 	ChunkStoreEntry *cse = ts_subspace_store_get(h->chunk_cache, point);
@@ -1171,7 +1169,7 @@ hypertable_get_chunk(Hypertable *h, Point *point, bool create_if_not_exists, boo
 
 /* finds the chunk for a given point, returning NULL if none exists */
 Chunk *
-ts_hypertable_find_chunk_if_exists(Hypertable *h, Point *point)
+ts_hypertable_find_chunk_if_exists(const Hypertable *h, const Point *point)
 {
 	return hypertable_get_chunk(h, point, false, false);
 }
@@ -1180,13 +1178,13 @@ ts_hypertable_find_chunk_if_exists(Hypertable *h, Point *point)
  * existing chunk exists, all its dimension slices will be locked in FOR KEY
  * SHARE mode. */
 Chunk *
-ts_hypertable_get_or_create_chunk(Hypertable *h, Point *point)
+ts_hypertable_get_or_create_chunk(const Hypertable *h, const Point *point)
 {
 	return hypertable_get_chunk(h, point, true, true);
 }
 
 bool
-ts_hypertable_has_tablespace(Hypertable *ht, Oid tspc_oid)
+ts_hypertable_has_tablespace(const Hypertable *ht, Oid tspc_oid)
 {
 	Tablespaces *tspcs = ts_tablespace_scan(ht->fd.id);
 
@@ -1194,10 +1192,11 @@ ts_hypertable_has_tablespace(Hypertable *ht, Oid tspc_oid)
 }
 
 static int
-hypertable_get_chunk_slice_ordinal(Hypertable *ht, Hypercube *hc)
+hypertable_get_chunk_round_robin_index(const Hypertable *ht, const Hypercube *hc)
 {
-	Dimension *dim;
-	DimensionSlice *slice;
+	const Dimension *dim;
+	const DimensionSlice *slice;
+	int offset = 0;
 
 	Assert(NULL != ht);
 	Assert(NULL != hc);
@@ -1205,7 +1204,17 @@ hypertable_get_chunk_slice_ordinal(Hypertable *ht, Hypercube *hc)
 	dim = hyperspace_get_closed_dimension(ht->space, 0);
 
 	if (NULL == dim)
+	{
 		dim = hyperspace_get_open_dimension(ht->space, 0);
+		/* Add some randomness between hypertables so that
+		 * if there is no space partitions, but multiple hypertables
+		 * the initial index is different for different hypertables.
+		 * This protects against creating a lot of chunks on the same
+		 * data node when many hypertables are created at roughly
+		 * the same time, e.g., from a bootstrap script.
+		 */
+		offset = (int) ht->fd.id;
+	}
 
 	Assert(NULL != dim);
 
@@ -1213,7 +1222,7 @@ hypertable_get_chunk_slice_ordinal(Hypertable *ht, Hypercube *hc)
 
 	Assert(NULL != slice);
 
-	return ts_dimension_get_slice_ordinal(dim, slice);
+	return ts_dimension_get_slice_ordinal(dim, slice) + offset;
 }
 
 /*
@@ -1227,7 +1236,7 @@ hypertable_get_chunk_slice_ordinal(Hypertable *ht, Hypercube *hc)
  * "space" partition will live on the same disk.
  */
 Tablespace *
-ts_hypertable_select_tablespace(Hypertable *ht, Chunk *chunk)
+ts_hypertable_select_tablespace(const Hypertable *ht, const Chunk *chunk)
 {
 	Tablespaces *tspcs = ts_tablespace_scan(ht->fd.id);
 	int i;
@@ -1235,14 +1244,14 @@ ts_hypertable_select_tablespace(Hypertable *ht, Chunk *chunk)
 	if (NULL == tspcs || tspcs->num_tablespaces == 0)
 		return NULL;
 
-	i = hypertable_get_chunk_slice_ordinal(ht, chunk->cube);
+	i = hypertable_get_chunk_round_robin_index(ht, chunk->cube);
 
 	/* Use the index of the slice to find the tablespace */
 	return &tspcs->tablespaces[i % tspcs->num_tablespaces];
 }
 
 const char *
-ts_hypertable_select_tablespace_name(Hypertable *ht, Chunk *chunk)
+ts_hypertable_select_tablespace_name(const Hypertable *ht, const Chunk *chunk)
 {
 	Tablespace *tspc = ts_hypertable_select_tablespace(ht, chunk);
 	Oid main_tspc_oid;
@@ -1364,7 +1373,7 @@ relation_has_tuples(Relation rel)
 {
 	TableScanDesc scandesc = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
 	TupleTableSlot *slot =
-		MakeSingleTupleTableSlotCompat(RelationGetDescr(rel), table_slot_callbacks(rel));
+		MakeSingleTupleTableSlot(RelationGetDescr(rel), table_slot_callbacks(rel));
 	bool hastuples = table_scan_getnextslot(scandesc, ForwardScanDirection, slot);
 
 	heap_endscan(scandesc);
@@ -1389,7 +1398,7 @@ table_is_logged(Oid table_relid)
 }
 
 static bool
-table_has_replica_identity(Relation rel)
+table_has_replica_identity(const Relation rel)
 {
 	return rel->rd_rel->relreplident != REPLICA_IDENTITY_DEFAULT;
 }
@@ -1561,11 +1570,7 @@ old_insert_blocker_trigger_get(Oid relid)
 					strlen(OLD_INSERT_BLOCKER_NAME)) == 0 &&
 			trig->tgisinternal)
 		{
-#if PG12_LT
-			tgoid = HeapTupleGetOid(tuple);
-#else
 			tgoid = trig->oid;
-#endif
 			break;
 		}
 	}
@@ -1672,7 +1677,7 @@ ts_hypertable_insert_blocker_trigger_add(PG_FUNCTION_ARGS)
 }
 
 static Datum
-create_hypertable_datum(FunctionCallInfo fcinfo, Hypertable *ht, bool created)
+create_hypertable_datum(FunctionCallInfo fcinfo, const Hypertable *ht, bool created)
 {
 	TupleDesc tupdesc;
 	Datum values[Natts_create_hypertable];
@@ -1702,9 +1707,9 @@ create_hypertable_datum(FunctionCallInfo fcinfo, Hypertable *ht, bool created)
  * not. Typically called after applying updates to a partitioning dimension.
  */
 void
-ts_hypertable_check_partitioning(Hypertable *ht, int32 id_of_updated_dimension)
+ts_hypertable_check_partitioning(const Hypertable *ht, int32 id_of_updated_dimension)
 {
-	Dimension *dim;
+	const Dimension *dim;
 
 	Assert(id_of_updated_dimension != InvalidOid);
 
@@ -1714,7 +1719,7 @@ ts_hypertable_check_partitioning(Hypertable *ht, int32 id_of_updated_dimension)
 
 	if (hypertable_is_distributed(ht))
 	{
-		Dimension *first_closed_dim = hyperspace_get_closed_dimension(ht->space, 0);
+		const Dimension *first_closed_dim = hyperspace_get_closed_dimension(ht->space, 0);
 		int num_nodes = list_length(ht->data_nodes);
 
 		/* Warn the user that there aren't enough slices to make use of all
@@ -2306,7 +2311,7 @@ typedef struct AccumHypertable
 } AccumHypertable;
 
 bool
-ts_is_partitioning_column(Hypertable *ht, Index column_attno)
+ts_is_partitioning_column(const Hypertable *ht, Index column_attno)
 {
 	uint16 i;
 
@@ -2375,7 +2380,7 @@ ts_hypertable_set_integer_now_func(PG_FUNCTION_ARGS)
 	bool replace_if_exists = PG_GETARG_BOOL(2);
 	Hypertable *hypertable;
 	Cache *hcache;
-	Dimension *open_dim;
+	const Dimension *open_dim;
 	Oid open_dim_type;
 	AclResult aclresult;
 
@@ -2525,7 +2530,7 @@ ts_hypertable_create_compressed(Oid table_relid, int32 hypertable_id)
 }
 
 TSDLLEXPORT void
-ts_hypertable_clone_constraints_to_compressed(Hypertable *user_ht, List *constraint_list)
+ts_hypertable_clone_constraints_to_compressed(const Hypertable *user_ht, List *constraint_list)
 {
 	CatalogSecurityContext sec_ctx;
 
@@ -2546,7 +2551,7 @@ ts_hypertable_clone_constraints_to_compressed(Hypertable *user_ht, List *constra
 
 #if defined(USE_ASSERT_CHECKING)
 static void
-assert_chunk_data_nodes_is_a_set(List *chunk_data_nodes)
+assert_chunk_data_nodes_is_a_set(const List *chunk_data_nodes)
 {
 	Bitmapset *chunk_data_node_oids = NULL;
 	ListCell *lc;
@@ -2568,14 +2573,14 @@ assert_chunk_data_nodes_is_a_set(List *chunk_data_nodes)
  * happens similar to tablespaces, i.e., based on dimension type.
  */
 List *
-ts_hypertable_assign_chunk_data_nodes(Hypertable *ht, Hypercube *cube)
+ts_hypertable_assign_chunk_data_nodes(const Hypertable *ht, const Hypercube *cube)
 {
 	List *chunk_data_nodes = NIL;
 	List *available_nodes = ts_hypertable_get_available_data_nodes(ht, true);
 	int num_assigned = MIN(ht->fd.replication_factor, list_length(available_nodes));
 	int n, i;
 
-	n = hypertable_get_chunk_slice_ordinal(ht, cube);
+	n = hypertable_get_chunk_round_robin_index(ht, cube);
 
 	for (i = 0; i < num_assigned; i++)
 	{
@@ -2601,30 +2606,34 @@ ts_hypertable_assign_chunk_data_nodes(Hypertable *ht, Hypercube *cube)
 	return chunk_data_nodes;
 }
 
-typedef bool (*hypertable_data_node_filter)(HypertableDataNode *hdn);
+typedef bool (*hypertable_data_node_filter)(const HypertableDataNode *hdn);
 
 static bool
-filter_non_blocked_data_nodes(HypertableDataNode *node)
+filter_non_blocked_data_nodes(const HypertableDataNode *node)
 {
 	return !node->fd.block_chunks;
 }
 
-typedef void *(*get_value)(HypertableDataNode *hdn);
+typedef void *(*get_value)(const HypertableDataNode *hdn);
 
 static void *
-get_hypertable_data_node_name(HypertableDataNode *node)
+get_hypertable_data_node_name(const HypertableDataNode *node)
 {
 	return pstrdup(NameStr(node->fd.node_name));
 }
 
 static void *
-get_hypertable_data_node(HypertableDataNode *node)
+get_hypertable_data_node(const HypertableDataNode *node)
 {
-	return node;
+	HypertableDataNode *copy = palloc(sizeof(HypertableDataNode));
+
+	memcpy(copy, node, sizeof(HypertableDataNode));
+	return copy;
 }
 
 static List *
-get_hypertable_data_node_values(Hypertable *ht, hypertable_data_node_filter filter, get_value value)
+get_hypertable_data_node_values(const Hypertable *ht, hypertable_data_node_filter filter,
+								get_value value)
 {
 	List *list = NULL;
 	ListCell *cell;
@@ -2640,13 +2649,13 @@ get_hypertable_data_node_values(Hypertable *ht, hypertable_data_node_filter filt
 }
 
 List *
-ts_hypertable_get_data_node_name_list(Hypertable *ht)
+ts_hypertable_get_data_node_name_list(const Hypertable *ht)
 {
 	return get_hypertable_data_node_values(ht, NULL, get_hypertable_data_node_name);
 }
 
 List *
-ts_hypertable_get_available_data_nodes(Hypertable *ht, bool error_if_missing)
+ts_hypertable_get_available_data_nodes(const Hypertable *ht, bool error_if_missing)
 {
 	List *available_nodes = get_hypertable_data_node_values(ht,
 															filter_non_blocked_data_nodes,
@@ -2661,7 +2670,7 @@ ts_hypertable_get_available_data_nodes(Hypertable *ht, bool error_if_missing)
 }
 
 static List *
-get_hypertable_data_node_ids(Hypertable *ht, hypertable_data_node_filter filter)
+get_hypertable_data_node_ids(const Hypertable *ht, hypertable_data_node_filter filter)
 {
 	List *nodeids = NIL;
 	ListCell *lc;
@@ -2677,19 +2686,19 @@ get_hypertable_data_node_ids(Hypertable *ht, hypertable_data_node_filter filter)
 }
 
 List *
-ts_hypertable_get_data_node_serverids_list(Hypertable *ht)
+ts_hypertable_get_data_node_serverids_list(const Hypertable *ht)
 {
 	return get_hypertable_data_node_ids(ht, NULL);
 }
 
 List *
-ts_hypertable_get_available_data_node_server_oids(Hypertable *ht)
+ts_hypertable_get_available_data_node_server_oids(const Hypertable *ht)
 {
 	return get_hypertable_data_node_ids(ht, filter_non_blocked_data_nodes);
 }
 
 HypertableType
-ts_hypertable_get_type(Hypertable *ht)
+ts_hypertable_get_type(const Hypertable *ht)
 {
 	Assert(ht->fd.replication_factor >= -1);
 	if (ht->fd.replication_factor < 1)
@@ -2698,7 +2707,7 @@ ts_hypertable_get_type(Hypertable *ht)
 }
 
 void
-ts_hypertable_func_call_on_data_nodes(Hypertable *ht, FunctionCallInfo fcinfo)
+ts_hypertable_func_call_on_data_nodes(const Hypertable *ht, FunctionCallInfo fcinfo)
 {
 	if (hypertable_is_distributed(ht))
 		ts_cm_functions->func_call_on_data_nodes(fcinfo, ts_hypertable_get_data_node_name_list(ht));
@@ -2711,7 +2720,7 @@ Datum
 ts_hypertable_get_open_dim_max_value(const Hypertable *ht, int dimension_index, bool *isnull)
 {
 	StringInfo command;
-	Dimension *dim;
+	const Dimension *dim;
 	int res;
 	bool max_isnull;
 	Datum maxdat;

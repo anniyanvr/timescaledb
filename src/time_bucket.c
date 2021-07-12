@@ -5,11 +5,12 @@
  */
 #include <postgres.h>
 #include <catalog/pg_type.h>
-#include <utils/timestamp.h>
-#include <utils/datetime.h>
-#include <utils/date.h>
-#include <utils/fmgrprotos.h>
 #include <fmgr.h>
+#include <utils/builtins.h>
+#include <utils/date.h>
+#include <utils/datetime.h>
+#include <utils/fmgrprotos.h>
+#include <utils/timestamp.h>
 
 #include "utils.h"
 #include "time_bucket.h"
@@ -20,7 +21,7 @@
 		if (period <= 0)                                                                           \
 			ereport(ERROR,                                                                         \
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),                                     \
-					 errmsg("period must be greater then 0")));                                    \
+					 errmsg("period must be greater than 0")));                                    \
 		if (offset != 0)                                                                           \
 		{                                                                                          \
 			/* We need to ensure that the timestamp is in range _after_ the */                     \
@@ -104,7 +105,7 @@ ts_int64_bucket(PG_FUNCTION_ARGS)
 		if (period <= 0)                                                                           \
 			ereport(ERROR,                                                                         \
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),                                     \
-					 errmsg("period must be greater then 0")));                                    \
+					 errmsg("period must be greater than 0")));                                    \
 		/* shift = shift % period, but use TMODULO */                                              \
 		TMODULO(shift, result, period);                                                            \
                                                                                                    \
@@ -283,7 +284,7 @@ ts_time_bucket_by_type(int64 interval, int64 timestamp, Oid timestamp_type)
 			bucket_function = ts_date_bucket;
 			break;
 		default:
-			elog(ERROR, "invalid time_bucket Oid %d", timestamp_type);
+			elog(ERROR, "invalid time_bucket type \"%s\"", format_type_be(timestamp_type));
 	}
 
 	time_bucketed =

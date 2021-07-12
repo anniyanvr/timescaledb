@@ -28,6 +28,8 @@ GRANT USAGE ON FOREIGN SERVER :DATA_NODE_1, :DATA_NODE_2, :DATA_NODE_3 TO PUBLIC
 -- Import testsupport.sql file to data nodes
 \unset ECHO
 SET ROLE :ROLE_1;
+--Ensure INSERTs use DataNodeDispatch. DataNodeCopy is tested later
+SET timescaledb.enable_distributed_insert_with_copy=false;
 -- Verify lack of tables
 SELECT node_name, "options" FROM timescaledb_information.data_nodes ORDER BY node_name;
       node_name       |                         options                         
@@ -96,7 +98,7 @@ $BODY$
 DECLARE
     cnt INTEGER;
 BEGIN
-    SELECT count(*) INTO cnt FROM hyper;
+    SELECT count(*) INTO cnt FROM public.disttable;
     RAISE WARNING 'FIRING trigger when: % level: % op: % cnt: % trigger_name %',
         tg_when, tg_level, tg_op, cnt, tg_name;
 
@@ -106,10 +108,29 @@ BEGIN
     RETURN NEW;
 END
 $BODY$;
+-- Create the trigger function on the data nodes:
+CALL distributed_exec($$
+CREATE OR REPLACE FUNCTION test_trigger()
+    RETURNS TRIGGER LANGUAGE PLPGSQL AS
+$BODY$
+DECLARE
+    cnt INTEGER;
+BEGIN
+    SELECT count(*) INTO cnt FROM public.disttable;
+    RAISE WARNING 'FIRING trigger when: % level: % op: % cnt: % trigger_name %',
+        tg_when, tg_level, tg_op, cnt, tg_name;
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END
+$BODY$;
+$$);
 CREATE TRIGGER _0_test_trigger_insert
     BEFORE INSERT ON disttable
     FOR EACH ROW EXECUTE FUNCTION test_trigger();
-SELECT * FROM _timescaledb_catalog.hypertable_data_node;
+SELECT * FROM _timescaledb_catalog.hypertable_data_node ORDER BY 1,2,3;
  hypertable_id | node_hypertable_id |      node_name       | block_chunks 
 ---------------+--------------------+----------------------+--------------
              1 |                  1 | db_dist_hypertable_1 | f
@@ -120,7 +141,7 @@ SELECT * FROM _timescaledb_catalog.hypertable_data_node;
              2 |                  2 | db_dist_hypertable_3 | f
 (6 rows)
 
-SELECT * FROM _timescaledb_catalog.chunk_data_node;
+SELECT * FROM _timescaledb_catalog.chunk_data_node ORDER BY 1,2,3;
  chunk_id | node_chunk_id | node_name 
 ----------+---------------+-----------
 (0 rows)
@@ -192,16 +213,27 @@ INSERT INTO disttable VALUES
 INSERT INTO disttable VALUES
        ('2017-01-01 06:01', 1, 1.1),
        ('2017-01-01 09:11', 3, 2.1),
+       ('2017-01-01 09:21', 3, 2.2),
+       ('2017-01-01 08:11', 3, 2.3),
        ('2017-01-01 08:01', 1, 1.2),
        ('2017-01-02 08:01', 2, 1.3),
+       ('2017-01-02 09:01', 2, 1.4),
+       ('2017-01-02 08:21', 2, 1.5),
        ('2018-07-02 08:01', 87, 1.6),
+       ('2018-07-02 09:01', 87, 1.4),
+       ('2018-07-02 09:21', 87, 1.8),
        ('2018-07-01 06:01', 13, 1.4),
+       ('2018-07-01 06:21', 13, 1.5),
+       ('2018-07-01 07:01', 13, 1.4),
        ('2018-07-01 09:11', 90, 2.7),
-       ('2018-07-01 08:01', 29, 1.5);
+       ('2018-07-01 08:01', 29, 1.5),
+       ('2018-07-01 09:21', 90, 2.8),
+       ('2018-07-01 08:21', 29, 1.2);
 -- Test distributed ANALYZE.
 --
 -- First show no statistics
-SELECT relname, relkind, reltuples, relpages
+-- reltuples is initially -1 before any VACUUM/ANALYZE has been run on PG14
+SELECT relname, relkind, CASE WHEN reltuples > 0 THEN reltuples ELSE 0 END AS reltuples, relpages
 FROM pg_class
 WHERE oid = 'disttable'::regclass;
   relname  | relkind | reltuples | relpages 
@@ -209,7 +241,7 @@ WHERE oid = 'disttable'::regclass;
  disttable | r       |         0 |        0
 (1 row)
 
-SELECT relname, relkind, reltuples, relpages
+SELECT relname, relkind, CASE WHEN reltuples > 0 THEN reltuples ELSE 0 END AS reltuples, relpages
 FROM pg_class cl, (SELECT show_chunks AS chunk FROM show_chunks('disttable')) ch
 WHERE cl.oid = ch.chunk::regclass;
         relname        | relkind | reltuples | relpages 
@@ -224,7 +256,7 @@ WHERE cl.oid = ch.chunk::regclass;
 
 ANALYZE disttable;
 -- Show updated statistics
-SELECT relname, relkind, reltuples, relpages
+SELECT relname, relkind, CASE WHEN reltuples > 0 THEN reltuples ELSE 0 END AS reltuples, relpages
 FROM pg_class
 WHERE oid = 'disttable'::regclass;
   relname  | relkind | reltuples | relpages 
@@ -238,11 +270,11 @@ WHERE cl.oid = ch.chunk::regclass;
         relname        | relkind | reltuples | relpages 
 -----------------------+---------+-----------+----------
  _dist_hyper_1_1_chunk | f       |         2 |        1
- _dist_hyper_1_2_chunk | f       |         1 |        1
- _dist_hyper_1_3_chunk | f       |         1 |        1
- _dist_hyper_1_4_chunk | f       |         1 |        1
- _dist_hyper_1_5_chunk | f       |         1 |        1
- _dist_hyper_1_6_chunk | f       |         2 |        1
+ _dist_hyper_1_2_chunk | f       |         3 |        1
+ _dist_hyper_1_3_chunk | f       |         3 |        1
+ _dist_hyper_1_4_chunk | f       |         3 |        1
+ _dist_hyper_1_5_chunk | f       |         3 |        1
+ _dist_hyper_1_6_chunk | f       |         4 |        1
 (6 rows)
 
 -- Test distributed VACUUM.
@@ -273,7 +305,7 @@ FROM show_chunks('disttable');
 (6 rows)
 
 -- Show that there are assigned node_chunk_id:s in chunk data node mappings
-SELECT * FROM _timescaledb_catalog.chunk_data_node;
+SELECT * FROM _timescaledb_catalog.chunk_data_node ORDER BY 1,2,3;
  chunk_id | node_chunk_id |      node_name       
 ----------+---------------+----------------------
         1 |             1 | db_dist_hypertable_1
@@ -340,7 +372,9 @@ Sun Jan 01 06:01:00 2017 PST|     1| 1.1
 Sun Jan 01 08:01:00 2017 PST|     1| 1.2
 Sun Jan 01 06:05:00 2017 PST|     1| 1.4
 Mon Jul 02 08:01:00 2018 PDT|    87| 1.6
-(4 rows)
+Mon Jul 02 09:01:00 2018 PDT|    87| 1.4
+Mon Jul 02 09:21:00 2018 PDT|    87| 1.8
+(6 rows)
 
 
 NOTICE:  [db_dist_hypertable_2]: 
@@ -349,8 +383,12 @@ NOTICE:  [db_dist_hypertable_2]:
 time                        |device|temp
 ----------------------------+------+----
 Mon Jan 02 08:01:00 2017 PST|     2| 1.3
+Mon Jan 02 09:01:00 2017 PST|     2| 1.4
+Mon Jan 02 08:21:00 2017 PST|     2| 1.5
 Sun Jul 01 06:01:00 2018 PDT|    13| 1.4
-(2 rows)
+Sun Jul 01 06:21:00 2018 PDT|    13| 1.5
+Sun Jul 01 07:01:00 2018 PDT|    13| 1.4
+(6 rows)
 
 
 NOTICE:  [db_dist_hypertable_3]: 
@@ -359,9 +397,13 @@ NOTICE:  [db_dist_hypertable_3]:
 time                        |device|temp
 ----------------------------+------+----
 Sun Jan 01 09:11:00 2017 PST|     3| 2.1
+Sun Jan 01 09:21:00 2017 PST|     3| 2.2
+Sun Jan 01 08:11:00 2017 PST|     3| 2.3
 Sun Jul 01 09:11:00 2018 PDT|    90| 2.7
 Sun Jul 01 08:01:00 2018 PDT|    29| 1.5
-(3 rows)
+Sun Jul 01 09:21:00 2018 PDT|    90| 2.8
+Sun Jul 01 08:21:00 2018 PDT|    29| 1.2
+(7 rows)
 
 
  remote_exec 
@@ -418,12 +460,22 @@ SELECT * FROM disttable;
  Sun Jan 01 08:01:00 2017 PST |      1 |  1.2
  Sun Jan 01 06:05:00 2017 PST |      1 |  1.4
  Mon Jul 02 08:01:00 2018 PDT |     87 |  1.6
+ Mon Jul 02 09:01:00 2018 PDT |     87 |  1.4
+ Mon Jul 02 09:21:00 2018 PDT |     87 |  1.8
  Mon Jan 02 08:01:00 2017 PST |      2 |  1.3
+ Mon Jan 02 09:01:00 2017 PST |      2 |  1.4
+ Mon Jan 02 08:21:00 2017 PST |      2 |  1.5
  Sun Jul 01 06:01:00 2018 PDT |     13 |  1.4
+ Sun Jul 01 06:21:00 2018 PDT |     13 |  1.5
+ Sun Jul 01 07:01:00 2018 PDT |     13 |  1.4
  Sun Jan 01 09:11:00 2017 PST |      3 |  2.1
+ Sun Jan 01 09:21:00 2017 PST |      3 |  2.2
+ Sun Jan 01 08:11:00 2017 PST |      3 |  2.3
  Sun Jul 01 09:11:00 2018 PDT |     90 |  2.7
  Sun Jul 01 08:01:00 2018 PDT |     29 |  1.5
-(9 rows)
+ Sun Jul 01 09:21:00 2018 PDT |     90 |  2.8
+ Sun Jul 01 08:21:00 2018 PDT |     29 |  1.2
+(19 rows)
 
 EXPLAIN (VERBOSE, COSTS FALSE)
 SELECT time_bucket('3 hours', time) AS time, device, avg(temp) AS avg_temp
@@ -463,42 +515,52 @@ SELECT * FROM disttable;
  Sun Jan 01 08:01:00 2017 PST |      1 |  1.2
  Sun Jan 01 06:05:00 2017 PST |      1 |  1.4
  Mon Jul 02 08:01:00 2018 PDT |     87 |  1.6
+ Mon Jul 02 09:01:00 2018 PDT |     87 |  1.4
+ Mon Jul 02 09:21:00 2018 PDT |     87 |  1.8
  Mon Jan 02 08:01:00 2017 PST |      2 |  1.3
+ Mon Jan 02 09:01:00 2017 PST |      2 |  1.4
+ Mon Jan 02 08:21:00 2017 PST |      2 |  1.5
  Sun Jul 01 06:01:00 2018 PDT |     13 |  1.4
+ Sun Jul 01 06:21:00 2018 PDT |     13 |  1.5
+ Sun Jul 01 07:01:00 2018 PDT |     13 |  1.4
  Sun Jan 01 09:11:00 2017 PST |      3 |  2.1
+ Sun Jan 01 09:21:00 2017 PST |      3 |  2.2
+ Sun Jan 01 08:11:00 2017 PST |      3 |  2.3
  Sun Jul 01 09:11:00 2018 PDT |     90 |  2.7
  Sun Jul 01 08:01:00 2018 PDT |     29 |  1.5
-(9 rows)
+ Sun Jul 01 09:21:00 2018 PDT |     90 |  2.8
+ Sun Jul 01 08:21:00 2018 PDT |     29 |  1.2
+(19 rows)
 
 SELECT time_bucket('3 hours', time) AS time, device, avg(temp) AS avg_temp
 FROM disttable
 GROUP BY 1, 2
 ORDER BY 1;
-             time             | device | avg_temp 
-------------------------------+--------+----------
- Sun Jan 01 04:00:00 2017 PST |      1 |     1.25
- Sun Jan 01 07:00:00 2017 PST |      1 |      1.2
- Sun Jan 01 07:00:00 2017 PST |      3 |      2.1
- Mon Jan 02 07:00:00 2017 PST |      2 |      1.3
- Sun Jul 01 05:00:00 2018 PDT |     13 |      1.4
- Sun Jul 01 08:00:00 2018 PDT |     29 |      1.5
- Sun Jul 01 08:00:00 2018 PDT |     90 |      2.7
- Mon Jul 02 08:00:00 2018 PDT |     87 |      1.6
+             time             | device |     avg_temp     
+------------------------------+--------+------------------
+ Sun Jan 01 04:00:00 2017 PST |      1 |             1.25
+ Sun Jan 01 07:00:00 2017 PST |      1 |              1.2
+ Sun Jan 01 07:00:00 2017 PST |      3 |              2.2
+ Mon Jan 02 07:00:00 2017 PST |      2 |              1.4
+ Sun Jul 01 05:00:00 2018 PDT |     13 | 1.43333333333333
+ Sun Jul 01 08:00:00 2018 PDT |     29 |             1.35
+ Sun Jul 01 08:00:00 2018 PDT |     90 |             2.75
+ Mon Jul 02 08:00:00 2018 PDT |     87 |              1.6
 (8 rows)
 
 SELECT time_bucket('3 hours', time) AS time, device, avg(temp) AS avg_temp
 FROM disttable GROUP BY 1, 2
 HAVING avg(temp) > 1.2
 ORDER BY 1;
-             time             | device | avg_temp 
-------------------------------+--------+----------
- Sun Jan 01 04:00:00 2017 PST |      1 |     1.25
- Sun Jan 01 07:00:00 2017 PST |      3 |      2.1
- Mon Jan 02 07:00:00 2017 PST |      2 |      1.3
- Sun Jul 01 05:00:00 2018 PDT |     13 |      1.4
- Sun Jul 01 08:00:00 2018 PDT |     29 |      1.5
- Sun Jul 01 08:00:00 2018 PDT |     90 |      2.7
- Mon Jul 02 08:00:00 2018 PDT |     87 |      1.6
+             time             | device |     avg_temp     
+------------------------------+--------+------------------
+ Sun Jan 01 04:00:00 2017 PST |      1 |             1.25
+ Sun Jan 01 07:00:00 2017 PST |      3 |              2.2
+ Mon Jan 02 07:00:00 2017 PST |      2 |              1.4
+ Sun Jul 01 05:00:00 2018 PDT |     13 | 1.43333333333333
+ Sun Jul 01 08:00:00 2018 PDT |     29 |             1.35
+ Sun Jul 01 08:00:00 2018 PDT |     90 |             2.75
+ Mon Jul 02 08:00:00 2018 PDT |     87 |              1.6
 (7 rows)
 
 SELECT time_bucket('3 hours', time) AS time, device, avg(temp) AS avg_temp
@@ -509,8 +571,8 @@ HAVING avg(temp) > 1.2
 ORDER BY 1;
              time             | device | avg_temp 
 ------------------------------+--------+----------
- Sun Jan 01 07:00:00 2017 PST |      3 |      2.1
- Sun Jul 01 08:00:00 2018 PDT |     90 |      2.7
+ Sun Jan 01 07:00:00 2017 PST |      3 |      2.2
+ Sun Jul 01 08:00:00 2018 PDT |     90 |     2.75
 (2 rows)
 
 -- Test AsyncAppend when using min/max aggregates
@@ -549,7 +611,7 @@ SELECT max(temp)
 FROM disttable;
  max 
 -----
- 2.7
+ 2.8
 (1 row)
 
 -- Test turning off async append
@@ -615,7 +677,7 @@ SELECT min(temp), max(temp)
 FROM disttable;
  min | max 
 -----+-----
- 1.1 | 2.7
+ 1.1 | 2.8
 (1 row)
 
 -- Test AsyncAppend when using window functions
@@ -658,16 +720,110 @@ ORDER BY device, temp;
       1 |  1.1 | 1.23333333333333
       1 |  1.2 | 1.23333333333333
       1 |  1.4 | 1.23333333333333
-      2 |  1.3 |              1.3
-      3 |  2.1 |              2.1
-     13 |  1.4 |              1.4
-     29 |  1.5 |              1.5
+      2 |  1.3 |              1.4
+      2 |  1.4 |              1.4
+      2 |  1.5 |              1.4
+      3 |  2.1 |              2.2
+      3 |  2.2 |              2.2
+      3 |  2.3 |              2.2
+     13 |  1.4 | 1.43333333333333
+     13 |  1.4 | 1.43333333333333
+     13 |  1.5 | 1.43333333333333
+     29 |  1.2 |             1.35
+     29 |  1.5 |             1.35
+     87 |  1.4 |              1.6
      87 |  1.6 |              1.6
-     90 |  2.7 |              2.7
-(9 rows)
+     87 |  1.8 |              1.6
+     90 |  2.7 |             2.75
+     90 |  2.8 |             2.75
+(19 rows)
 
 -- Test remote explain
+-- Make sure that chunks_in function only expects one-dimensional integer arrays
+\set ON_ERROR_STOP 0
+SELECT "time" FROM public.disttable WHERE _timescaledb_internal.chunks_in(public.disttable.*, ARRAY[[2], [1]])
+ORDER BY "time" DESC NULLS FIRST LIMIT 1;
+ERROR:  invalid number of array dimensions for chunks_in
+\set ON_ERROR_STOP 1
 SET timescaledb.enable_remote_explain = ON;
+-- Check that datanodes use ChunkAppend plans with chunks_in function in the
+-- "Remote SQL" when using max(time).
+EXPLAIN (VERBOSE, COSTS FALSE)
+SELECT max(time)
+FROM disttable;
+                                                                                                       QUERY PLAN                                                                                                       
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: $0
+   InitPlan 1 (returns $0)
+     ->  Limit
+           Output: disttable."time"
+           ->  Custom Scan (AsyncAppend)
+                 Output: disttable."time"
+                 ->  Merge Append
+                       Sort Key: disttable_1."time" DESC
+                       ->  Custom Scan (DataNodeScan) on public.disttable disttable_1
+                             Output: disttable_1."time"
+                             Data node: db_dist_hypertable_1
+                             Chunks: _dist_hyper_1_4_chunk, _dist_hyper_1_1_chunk
+                             Remote SQL: SELECT "time" FROM public.disttable WHERE _timescaledb_internal.chunks_in(public.disttable.*, ARRAY[2, 1]) AND (("time" IS NOT NULL)) ORDER BY "time" DESC NULLS FIRST LIMIT 1
+                             Remote EXPLAIN: 
+                               Limit
+                                 Output: disttable."time"
+                                 ->  Custom Scan (ChunkAppend) on public.disttable
+                                       Output: disttable."time"
+                                       Order: disttable."time" DESC
+                                       Startup Exclusion: false
+                                       Runtime Exclusion: false
+                                       ->  Index Only Scan using _dist_hyper_1_4_chunk_disttable_time_idx on _timescaledb_internal._dist_hyper_1_4_chunk
+                                             Output: _dist_hyper_1_4_chunk."time"
+                                             Index Cond: (_dist_hyper_1_4_chunk."time" IS NOT NULL)
+                                       ->  Index Only Scan using _dist_hyper_1_1_chunk_disttable_time_idx on _timescaledb_internal._dist_hyper_1_1_chunk
+                                             Output: _dist_hyper_1_1_chunk."time"
+                                             Index Cond: (_dist_hyper_1_1_chunk."time" IS NOT NULL)
+ 
+                       ->  Custom Scan (DataNodeScan) on public.disttable disttable_2
+                             Output: disttable_2."time"
+                             Data node: db_dist_hypertable_2
+                             Chunks: _dist_hyper_1_5_chunk, _dist_hyper_1_3_chunk
+                             Remote SQL: SELECT "time" FROM public.disttable WHERE _timescaledb_internal.chunks_in(public.disttable.*, ARRAY[2, 1]) AND (("time" IS NOT NULL)) ORDER BY "time" DESC NULLS FIRST LIMIT 1
+                             Remote EXPLAIN: 
+                               Limit
+                                 Output: disttable."time"
+                                 ->  Custom Scan (ChunkAppend) on public.disttable
+                                       Output: disttable."time"
+                                       Order: disttable."time" DESC
+                                       Startup Exclusion: false
+                                       Runtime Exclusion: false
+                                       ->  Index Only Scan using _dist_hyper_1_5_chunk_disttable_time_idx on _timescaledb_internal._dist_hyper_1_5_chunk
+                                             Output: _dist_hyper_1_5_chunk."time"
+                                             Index Cond: (_dist_hyper_1_5_chunk."time" IS NOT NULL)
+                                       ->  Index Only Scan using _dist_hyper_1_3_chunk_disttable_time_idx on _timescaledb_internal._dist_hyper_1_3_chunk
+                                             Output: _dist_hyper_1_3_chunk."time"
+                                             Index Cond: (_dist_hyper_1_3_chunk."time" IS NOT NULL)
+ 
+                       ->  Custom Scan (DataNodeScan) on public.disttable disttable_3
+                             Output: disttable_3."time"
+                             Data node: db_dist_hypertable_3
+                             Chunks: _dist_hyper_1_6_chunk, _dist_hyper_1_2_chunk
+                             Remote SQL: SELECT "time" FROM public.disttable WHERE _timescaledb_internal.chunks_in(public.disttable.*, ARRAY[2, 1]) AND (("time" IS NOT NULL)) ORDER BY "time" DESC NULLS FIRST LIMIT 1
+                             Remote EXPLAIN: 
+                               Limit
+                                 Output: disttable."time"
+                                 ->  Custom Scan (ChunkAppend) on public.disttable
+                                       Output: disttable."time"
+                                       Order: disttable."time" DESC
+                                       Startup Exclusion: false
+                                       Runtime Exclusion: false
+                                       ->  Index Only Scan using _dist_hyper_1_6_chunk_disttable_time_idx on _timescaledb_internal._dist_hyper_1_6_chunk
+                                             Output: _dist_hyper_1_6_chunk."time"
+                                             Index Cond: (_dist_hyper_1_6_chunk."time" IS NOT NULL)
+                                       ->  Index Only Scan using _dist_hyper_1_2_chunk_disttable_time_idx on _timescaledb_internal._dist_hyper_1_2_chunk
+                                             Output: _dist_hyper_1_2_chunk."time"
+                                             Index Cond: (_dist_hyper_1_2_chunk."time" IS NOT NULL)
+ 
+(69 rows)
+
 EXPLAIN (VERBOSE, COSTS FALSE)
 SELECT max(temp)
 FROM disttable;
@@ -785,11 +941,11 @@ FROM disttable;
                                        Output: _dist_hyper_1_1_chunk.temp
                                        Sort Key: _dist_hyper_1_1_chunk.temp DESC
                                        Sort Method: top-N heapsort 
-                                       ->  Append (actual rows=4 loops=1)
+                                       ->  Append (actual rows=6 loops=1)
                                              ->  Seq Scan on _timescaledb_internal._dist_hyper_1_1_chunk (actual rows=3 loops=1)
                                                    Output: _dist_hyper_1_1_chunk.temp
                                                    Filter: (_dist_hyper_1_1_chunk.temp IS NOT NULL)
-                                             ->  Seq Scan on _timescaledb_internal._dist_hyper_1_4_chunk (actual rows=1 loops=1)
+                                             ->  Seq Scan on _timescaledb_internal._dist_hyper_1_4_chunk (actual rows=3 loops=1)
                                                    Output: _dist_hyper_1_4_chunk.temp
                                                    Filter: (_dist_hyper_1_4_chunk.temp IS NOT NULL)
  
@@ -804,12 +960,12 @@ FROM disttable;
                                  ->  Sort (actual rows=1 loops=1)
                                        Output: _dist_hyper_1_3_chunk.temp
                                        Sort Key: _dist_hyper_1_3_chunk.temp DESC
-                                       Sort Method: quicksort 
-                                       ->  Append (actual rows=2 loops=1)
-                                             ->  Seq Scan on _timescaledb_internal._dist_hyper_1_3_chunk (actual rows=1 loops=1)
+                                       Sort Method: top-N heapsort 
+                                       ->  Append (actual rows=6 loops=1)
+                                             ->  Seq Scan on _timescaledb_internal._dist_hyper_1_3_chunk (actual rows=3 loops=1)
                                                    Output: _dist_hyper_1_3_chunk.temp
                                                    Filter: (_dist_hyper_1_3_chunk.temp IS NOT NULL)
-                                             ->  Seq Scan on _timescaledb_internal._dist_hyper_1_5_chunk (actual rows=1 loops=1)
+                                             ->  Seq Scan on _timescaledb_internal._dist_hyper_1_5_chunk (actual rows=3 loops=1)
                                                    Output: _dist_hyper_1_5_chunk.temp
                                                    Filter: (_dist_hyper_1_5_chunk.temp IS NOT NULL)
  
@@ -825,11 +981,11 @@ FROM disttable;
                                        Output: _dist_hyper_1_2_chunk.temp
                                        Sort Key: _dist_hyper_1_2_chunk.temp DESC
                                        Sort Method: top-N heapsort 
-                                       ->  Append (actual rows=3 loops=1)
-                                             ->  Seq Scan on _timescaledb_internal._dist_hyper_1_2_chunk (actual rows=1 loops=1)
+                                       ->  Append (actual rows=7 loops=1)
+                                             ->  Seq Scan on _timescaledb_internal._dist_hyper_1_2_chunk (actual rows=3 loops=1)
                                                    Output: _dist_hyper_1_2_chunk.temp
                                                    Filter: (_dist_hyper_1_2_chunk.temp IS NOT NULL)
-                                             ->  Seq Scan on _timescaledb_internal._dist_hyper_1_6_chunk (actual rows=2 loops=1)
+                                             ->  Seq Scan on _timescaledb_internal._dist_hyper_1_6_chunk (actual rows=4 loops=1)
                                                    Output: _dist_hyper_1_6_chunk.temp
                                                    Filter: (_dist_hyper_1_6_chunk.temp IS NOT NULL)
  
@@ -875,7 +1031,7 @@ FROM test.show_subtables('disttable') st;
 (0 rows)
 
 -- Check that the chunks are assigned data nodes
-SELECT * FROM _timescaledb_catalog.chunk_data_node;
+SELECT * FROM _timescaledb_catalog.chunk_data_node ORDER BY 1,2,3;
  chunk_id | node_chunk_id |      node_name       
 ----------+---------------+----------------------
         1 |             1 | db_dist_hypertable_1
@@ -1024,12 +1180,22 @@ SELECT * FROM disttable;
  Sun Jan 01 08:01:00 2017 PST |      1 |  1.2 |      
  Sun Jan 01 06:05:00 2017 PST |      1 |  1.4 |      
  Mon Jul 02 08:01:00 2018 PDT |     87 |  1.6 |      
+ Mon Jul 02 09:01:00 2018 PDT |     87 |  1.4 |      
+ Mon Jul 02 09:21:00 2018 PDT |     87 |  1.8 |      
  Mon Jan 02 08:01:00 2017 PST |      2 |  1.3 |      
+ Mon Jan 02 09:01:00 2017 PST |      2 |  1.4 |      
+ Mon Jan 02 08:21:00 2017 PST |      2 |  1.5 |      
  Sun Jul 01 06:01:00 2018 PDT |     13 |  1.4 |      
+ Sun Jul 01 06:21:00 2018 PDT |     13 |  1.5 |      
+ Sun Jul 01 07:01:00 2018 PDT |     13 |  1.4 |      
  Sun Jan 01 09:11:00 2017 PST |      3 |  2.1 |      
+ Sun Jan 01 09:21:00 2017 PST |      3 |  2.2 |      
+ Sun Jan 01 08:11:00 2017 PST |      3 |  2.3 |      
  Sun Jul 01 09:11:00 2018 PDT |     90 |  2.7 |      
  Sun Jul 01 08:01:00 2018 PDT |     29 |  1.5 |      
-(9 rows)
+ Sun Jul 01 09:21:00 2018 PDT |     90 |  2.8 |      
+ Sun Jul 01 08:21:00 2018 PDT |     29 |  1.2 |      
+(19 rows)
 
 -- Test INSERTS with RETURNING. Since we previously dropped a column
 -- on the hypertable, this also tests that we handle conversion of the
@@ -1114,8 +1280,10 @@ Sun Jan 01 06:01:00 2017 PST|     1| 1.1|
 Sun Jan 01 08:01:00 2017 PST|     1| 1.2|     
 Sun Jan 01 06:05:00 2017 PST|     1| 1.4|     
 Mon Jul 02 08:01:00 2018 PDT|    87| 1.6|     
+Mon Jul 02 09:01:00 2018 PDT|    87| 1.4|     
+Mon Jul 02 09:21:00 2018 PDT|    87| 1.8|     
 Sat Sep 02 06:09:00 2017 PDT|     6|10.5|    2
-(5 rows)
+(7 rows)
 
 
 NOTICE:  [db_dist_hypertable_2]: 
@@ -1124,9 +1292,13 @@ NOTICE:  [db_dist_hypertable_2]:
 time                        |device|temp|Color
 ----------------------------+------+----+-----
 Mon Jan 02 08:01:00 2017 PST|     2| 1.3|     
+Mon Jan 02 09:01:00 2017 PST|     2| 1.4|     
+Mon Jan 02 08:21:00 2017 PST|     2| 1.5|     
 Sun Jul 01 06:01:00 2018 PDT|    13| 1.4|     
+Sun Jul 01 06:21:00 2018 PDT|    13| 1.5|     
+Sun Jul 01 07:01:00 2018 PDT|    13| 1.4|     
 Sat Sep 02 06:09:00 2017 PDT|     4| 9.8|    1
-(3 rows)
+(7 rows)
 
 
 NOTICE:  [db_dist_hypertable_3]: 
@@ -1135,10 +1307,14 @@ NOTICE:  [db_dist_hypertable_3]:
 time                        |device|temp|Color
 ----------------------------+------+----+-----
 Sun Jan 01 09:11:00 2017 PST|     3| 2.1|     
+Sun Jan 01 09:21:00 2017 PST|     3| 2.2|     
+Sun Jan 01 08:11:00 2017 PST|     3| 2.3|     
 Sun Jul 01 09:11:00 2018 PDT|    90| 2.7|     
 Sun Jul 01 08:01:00 2018 PDT|    29| 1.5|     
+Sun Jul 01 09:21:00 2018 PDT|    90| 2.8|     
+Sun Jul 01 08:21:00 2018 PDT|    29| 1.2|     
 Sun Sep 03 06:18:00 2017 PDT|     9| 8.7|    3
-(4 rows)
+(8 rows)
 
 
  remote_exec 
@@ -1191,16 +1367,26 @@ SELECT * FROM disttable;
  Sun Jan 01 08:01:00 2017 PST |      1 |  1.2 |      
  Sun Jan 01 06:05:00 2017 PST |      1 |  1.4 |      
  Mon Jul 02 08:01:00 2018 PDT |     87 |  1.6 |      
+ Mon Jul 02 09:01:00 2018 PDT |     87 |  1.4 |      
+ Mon Jul 02 09:21:00 2018 PDT |     87 |  1.8 |      
  Sat Sep 02 06:09:00 2017 PDT |      6 | 10.5 |     2
  Sun Sep 03 06:09:00 2017 PDT |      1 |    2 |     9
  Mon Jan 02 08:01:00 2017 PST |      2 |  1.3 |      
+ Mon Jan 02 09:01:00 2017 PST |      2 |  1.4 |      
+ Mon Jan 02 08:21:00 2017 PST |      2 |  1.5 |      
  Sun Jul 01 06:01:00 2018 PDT |     13 |  1.4 |      
+ Sun Jul 01 06:21:00 2018 PDT |     13 |  1.5 |      
+ Sun Jul 01 07:01:00 2018 PDT |     13 |  1.4 |      
  Sat Sep 02 06:09:00 2017 PDT |      4 |  9.8 |     1
  Sun Jan 01 09:11:00 2017 PST |      3 |  2.1 |      
+ Sun Jan 01 09:21:00 2017 PST |      3 |  2.2 |      
+ Sun Jan 01 08:11:00 2017 PST |      3 |  2.3 |      
  Sun Jul 01 09:11:00 2018 PDT |     90 |  2.7 |      
  Sun Jul 01 08:01:00 2018 PDT |     29 |  1.5 |      
+ Sun Jul 01 09:21:00 2018 PDT |     90 |  2.8 |      
+ Sun Jul 01 08:21:00 2018 PDT |     29 |  1.2 |      
  Sun Sep 03 06:18:00 2017 PDT |      9 |  8.7 |     4
-(13 rows)
+(23 rows)
 
 WITH devices AS (
      SELECT DISTINCT device FROM disttable ORDER BY device
@@ -1222,8 +1408,11 @@ RETURNING *;
              time             | device | temp | Color 
 ------------------------------+--------+------+-------
  Sun Jan 01 09:11:00 2017 PST |      3 |  2.1 |      
-(1 row)
+ Sun Jan 01 09:21:00 2017 PST |      3 |  2.2 |      
+ Sun Jan 01 08:11:00 2017 PST |      3 |  2.3 |      
+(3 rows)
 
+DELETE FROM disttable WHERE time IS NULL;
 -- Test deletes (rows deleted)
 DELETE FROM disttable WHERE device = 4
 RETURNING *;
@@ -1240,14 +1429,22 @@ SELECT * FROM disttable;
  Sun Jan 01 08:01:00 2017 PST |      1 |  1.2 |     2
  Sun Jan 01 06:05:00 2017 PST |      1 |  1.4 |     2
  Mon Jul 02 08:01:00 2018 PDT |     87 |  1.6 |      
+ Mon Jul 02 09:01:00 2018 PDT |     87 |  1.4 |      
+ Mon Jul 02 09:21:00 2018 PDT |     87 |  1.8 |      
  Sat Sep 02 06:09:00 2017 PDT |      6 | 10.5 |     2
  Sun Sep 03 06:09:00 2017 PDT |      1 |    2 |     2
  Mon Jan 02 08:01:00 2017 PST |      2 |  1.3 |      
+ Mon Jan 02 09:01:00 2017 PST |      2 |  1.4 |      
+ Mon Jan 02 08:21:00 2017 PST |      2 |  1.5 |      
  Sun Jul 01 06:01:00 2018 PDT |     13 |  1.4 |      
+ Sun Jul 01 06:21:00 2018 PDT |     13 |  1.5 |      
+ Sun Jul 01 07:01:00 2018 PDT |     13 |  1.4 |      
  Sun Jul 01 09:11:00 2018 PDT |     90 |  2.7 |      
  Sun Jul 01 08:01:00 2018 PDT |     29 |  1.5 |      
+ Sun Jul 01 09:21:00 2018 PDT |     90 |  2.8 |      
+ Sun Jul 01 08:21:00 2018 PDT |     29 |  1.2 |      
  Sun Sep 03 06:18:00 2017 PDT |      9 |  8.7 |     4
-(11 rows)
+(19 rows)
 
 -- Ensure rows are deleted on the data nodes
 SELECT * FROM test.remote_exec(ARRAY[:'DATA_NODE_1', :'DATA_NODE_2', :'DATA_NODE_3'], $$
@@ -1262,9 +1459,11 @@ Sun Jan 01 06:01:00 2017 PST|     1| 1.1|    2
 Sun Jan 01 08:01:00 2017 PST|     1| 1.2|    2
 Sun Jan 01 06:05:00 2017 PST|     1| 1.4|    2
 Mon Jul 02 08:01:00 2018 PDT|    87| 1.6|     
+Mon Jul 02 09:01:00 2018 PDT|    87| 1.4|     
+Mon Jul 02 09:21:00 2018 PDT|    87| 1.8|     
 Sat Sep 02 06:09:00 2017 PDT|     6|10.5|    2
 Sun Sep 03 06:09:00 2017 PDT|     1|   2|    2
-(6 rows)
+(8 rows)
 
 
 NOTICE:  [db_dist_hypertable_2]: 
@@ -1273,8 +1472,12 @@ NOTICE:  [db_dist_hypertable_2]:
 time                        |device|temp|Color
 ----------------------------+------+----+-----
 Mon Jan 02 08:01:00 2017 PST|     2| 1.3|     
+Mon Jan 02 09:01:00 2017 PST|     2| 1.4|     
+Mon Jan 02 08:21:00 2017 PST|     2| 1.5|     
 Sun Jul 01 06:01:00 2018 PDT|    13| 1.4|     
-(2 rows)
+Sun Jul 01 06:21:00 2018 PDT|    13| 1.5|     
+Sun Jul 01 07:01:00 2018 PDT|    13| 1.4|     
+(6 rows)
 
 
 NOTICE:  [db_dist_hypertable_3]: 
@@ -1284,8 +1487,10 @@ time                        |device|temp|Color
 ----------------------------+------+----+-----
 Sun Jul 01 09:11:00 2018 PDT|    90| 2.7|     
 Sun Jul 01 08:01:00 2018 PDT|    29| 1.5|     
+Sun Jul 01 09:21:00 2018 PDT|    90| 2.8|     
+Sun Jul 01 08:21:00 2018 PDT|    29| 1.2|     
 Sun Sep 03 06:18:00 2017 PDT|     9| 8.7|    4
-(3 rows)
+(5 rows)
 
 
  remote_exec 
@@ -1303,8 +1508,8 @@ SELECT * FROM disttable;
 
 -- Metadata and tables cleaned up
 SELECT * FROM _timescaledb_catalog.chunk;
- id | hypertable_id | schema_name | table_name | compressed_chunk_id | dropped 
-----+---------------+-------------+------------+---------------------+---------
+ id | hypertable_id | schema_name | table_name | compressed_chunk_id | dropped | status 
+----+---------------+-------------+------------+---------------------+---------+--------
 (0 rows)
 
 SELECT * FROM show_chunks('disttable');
@@ -1321,8 +1526,8 @@ $$);
 NOTICE:  [db_dist_hypertable_1]: 
 SELECT * FROM _timescaledb_catalog.chunk
 NOTICE:  [db_dist_hypertable_1]:
-id|hypertable_id|schema_name|table_name|compressed_chunk_id|dropped
---+-------------+-----------+----------+-------------------+-------
+id|hypertable_id|schema_name|table_name|compressed_chunk_id|dropped|status
+--+-------------+-----------+----------+-------------------+-------+------
 (0 rows)
 
 
@@ -1345,8 +1550,8 @@ time|device|temp|Color
 NOTICE:  [db_dist_hypertable_2]: 
 SELECT * FROM _timescaledb_catalog.chunk
 NOTICE:  [db_dist_hypertable_2]:
-id|hypertable_id|schema_name|table_name|compressed_chunk_id|dropped
---+-------------+-----------+----------+-------------------+-------
+id|hypertable_id|schema_name|table_name|compressed_chunk_id|dropped|status
+--+-------------+-----------+----------+-------------------+-------+------
 (0 rows)
 
 
@@ -1369,8 +1574,8 @@ time|device|temp|Color
 NOTICE:  [db_dist_hypertable_3]: 
 SELECT * FROM _timescaledb_catalog.chunk
 NOTICE:  [db_dist_hypertable_3]:
-id|hypertable_id|schema_name|table_name|compressed_chunk_id|dropped
---+-------------+-----------+----------+-------------------+-------
+id|hypertable_id|schema_name|table_name|compressed_chunk_id|dropped|status
+--+-------------+-----------+----------+-------------------+-------+------
 (0 rows)
 
 
@@ -1408,7 +1613,7 @@ ORDER BY hypertable_schema, hypertable_name;
 INSERT INTO underreplicated VALUES ('2017-01-01 06:01', 1, 1.1),
                                    ('2017-01-02 07:01', 2, 3.5);
 WARNING:  insufficient number of data nodes
-SELECT * FROM _timescaledb_catalog.chunk_data_node;
+SELECT * FROM _timescaledb_catalog.chunk_data_node ORDER BY 1,2,3;
  chunk_id | node_chunk_id |      node_name       
 ----------+---------------+----------------------
        10 |             4 | db_dist_hypertable_1
@@ -1424,7 +1629,7 @@ FROM show_chunks('underreplicated');
 (1 row)
 
 -- Show chunk data node mappings
-SELECT * FROM _timescaledb_catalog.chunk_data_node;
+SELECT * FROM _timescaledb_catalog.chunk_data_node ORDER BY 1,2,3;
  chunk_id | node_chunk_id |      node_name       
 ----------+---------------+----------------------
        10 |             4 | db_dist_hypertable_1
@@ -1666,6 +1871,8 @@ GRANT ALL ON SCHEMA "T3sTSch" TO :ROLE_1;
 GRANT ALL ON SCHEMA "Table\\Schema" TO :ROLE_1;
 SET ROLE :ROLE_1;
 \c :TEST_DBNAME :ROLE_SUPERUSER
+--Ensure INSERTs use DataNodeDispatch.
+SET timescaledb.enable_distributed_insert_with_copy=false;
 CREATE SCHEMA "T3sTSch";
 CREATE SCHEMA "Table\\Schema";
 CREATE SCHEMA "single'schema";
@@ -2268,8 +2475,8 @@ WITH devices AS (
      SELECT DISTINCT device FROM disttable_replicated ORDER BY device
 )
 UPDATE disttable_replicated SET device = 2 WHERE device = (SELECT device FROM devices LIMIT 1);
-                                                                                                  QUERY PLAN                                                                                                   
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                       QUERY PLAN                                                                                                       
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Update on public.disttable_replicated (actual rows=0 loops=1)
    Update on public.disttable_replicated
    Foreign Update on _timescaledb_internal._dist_hyper_6_12_chunk disttable_replicated_1
@@ -2297,17 +2504,17 @@ UPDATE disttable_replicated SET device = 2 WHERE device = (SELECT device FROM de
                                    Output: disttable_replicated_8.device
                                    Data node: db_dist_hypertable_1
                                    Chunks: _dist_hyper_6_12_chunk, _dist_hyper_6_15_chunk
-                                   Remote SQL: SELECT device FROM public.disttable_replicated WHERE _timescaledb_internal.chunks_in(public.disttable_replicated.*, ARRAY[6, 8]) ORDER BY device ASC NULLS LAST
+                                   Remote SQL: SELECT DISTINCT device FROM public.disttable_replicated WHERE _timescaledb_internal.chunks_in(public.disttable_replicated.*, ARRAY[6, 8]) ORDER BY device ASC NULLS LAST
                              ->  Custom Scan (DataNodeScan) on public.disttable_replicated disttable_replicated_9 (actual rows=1 loops=1)
                                    Output: disttable_replicated_9.device
                                    Data node: db_dist_hypertable_2
                                    Chunks: _dist_hyper_6_13_chunk, _dist_hyper_6_16_chunk
-                                   Remote SQL: SELECT device FROM public.disttable_replicated WHERE _timescaledb_internal.chunks_in(public.disttable_replicated.*, ARRAY[6, 8]) ORDER BY device ASC NULLS LAST
+                                   Remote SQL: SELECT DISTINCT device FROM public.disttable_replicated WHERE _timescaledb_internal.chunks_in(public.disttable_replicated.*, ARRAY[6, 8]) ORDER BY device ASC NULLS LAST
                              ->  Custom Scan (DataNodeScan) on public.disttable_replicated disttable_replicated_10 (actual rows=1 loops=1)
                                    Output: disttable_replicated_10.device
                                    Data node: db_dist_hypertable_3
                                    Chunks: _dist_hyper_6_14_chunk, _dist_hyper_6_17_chunk
-                                   Remote SQL: SELECT device FROM public.disttable_replicated WHERE _timescaledb_internal.chunks_in(public.disttable_replicated.*, ARRAY[6, 8]) ORDER BY device ASC NULLS LAST
+                                   Remote SQL: SELECT DISTINCT device FROM public.disttable_replicated WHERE _timescaledb_internal.chunks_in(public.disttable_replicated.*, ARRAY[6, 8]) ORDER BY device ASC NULLS LAST
    ->  Seq Scan on public.disttable_replicated (actual rows=0 loops=1)
          Output: disttable_replicated."time", 2, disttable_replicated.temp, disttable_replicated."Color", disttable_replicated.ctid
          Filter: (disttable_replicated.device = $0)
@@ -2483,6 +2690,73 @@ INSERT INTO twodim VALUES
 INSERT INTO twodim VALUES
        ('2019-02-10 16:23', 5, 7.1),
        ('2019-02-10 17:11', 7, 3.2);
+-- Check that datanodes use ChunkAppend plans with chunks_in function in the
+-- "Remote SQL" when multiple dimensions are involved.
+SET timescaledb.enable_remote_explain = ON;
+EXPLAIN (VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT * FROM twodim
+ORDER BY time;
+                                                                                     QUERY PLAN                                                                                     
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (AsyncAppend)
+   Output: twodim."time", twodim."Color", twodim.temp
+   ->  Merge Append
+         Sort Key: twodim_1."time"
+         ->  Custom Scan (DataNodeScan) on public.twodim twodim_1
+               Output: twodim_1."time", twodim_1."Color", twodim_1.temp
+               Data node: db_dist_hypertable_1
+               Chunks: _dist_hyper_7_18_chunk, _dist_hyper_7_22_chunk, _dist_hyper_7_25_chunk
+               Remote SQL: SELECT "time", "Color", temp FROM public.twodim WHERE _timescaledb_internal.chunks_in(public.twodim.*, ARRAY[10, 12, 14]) ORDER BY "time" ASC NULLS LAST
+               Remote EXPLAIN: 
+                 Custom Scan (ChunkAppend) on public.twodim
+                   Output: twodim."time", twodim."Color", twodim.temp
+                   Order: twodim."time"
+                   Startup Exclusion: false
+                   Runtime Exclusion: false
+                   ->  Index Scan Backward using _dist_hyper_7_18_chunk_twodim_time_idx on _timescaledb_internal._dist_hyper_7_18_chunk
+                         Output: _dist_hyper_7_18_chunk."time", _dist_hyper_7_18_chunk."Color", _dist_hyper_7_18_chunk.temp
+                   ->  Index Scan Backward using _dist_hyper_7_22_chunk_twodim_time_idx on _timescaledb_internal._dist_hyper_7_22_chunk
+                         Output: _dist_hyper_7_22_chunk."time", _dist_hyper_7_22_chunk."Color", _dist_hyper_7_22_chunk.temp
+                   ->  Index Scan Backward using _dist_hyper_7_25_chunk_twodim_time_idx on _timescaledb_internal._dist_hyper_7_25_chunk
+                         Output: _dist_hyper_7_25_chunk."time", _dist_hyper_7_25_chunk."Color", _dist_hyper_7_25_chunk.temp
+ 
+         ->  Custom Scan (DataNodeScan) on public.twodim twodim_2
+               Output: twodim_2."time", twodim_2."Color", twodim_2.temp
+               Data node: db_dist_hypertable_2
+               Chunks: _dist_hyper_7_19_chunk, _dist_hyper_7_21_chunk, _dist_hyper_7_24_chunk
+               Remote SQL: SELECT "time", "Color", temp FROM public.twodim WHERE _timescaledb_internal.chunks_in(public.twodim.*, ARRAY[10, 11, 13]) ORDER BY "time" ASC NULLS LAST
+               Remote EXPLAIN: 
+                 Custom Scan (ChunkAppend) on public.twodim
+                   Output: twodim."time", twodim."Color", twodim.temp
+                   Order: twodim."time"
+                   Startup Exclusion: false
+                   Runtime Exclusion: false
+                   ->  Index Scan Backward using _dist_hyper_7_19_chunk_twodim_time_idx on _timescaledb_internal._dist_hyper_7_19_chunk
+                         Output: _dist_hyper_7_19_chunk."time", _dist_hyper_7_19_chunk."Color", _dist_hyper_7_19_chunk.temp
+                   ->  Index Scan Backward using _dist_hyper_7_21_chunk_twodim_time_idx on _timescaledb_internal._dist_hyper_7_21_chunk
+                         Output: _dist_hyper_7_21_chunk."time", _dist_hyper_7_21_chunk."Color", _dist_hyper_7_21_chunk.temp
+                   ->  Index Scan Backward using _dist_hyper_7_24_chunk_twodim_time_idx on _timescaledb_internal._dist_hyper_7_24_chunk
+                         Output: _dist_hyper_7_24_chunk."time", _dist_hyper_7_24_chunk."Color", _dist_hyper_7_24_chunk.temp
+ 
+         ->  Custom Scan (DataNodeScan) on public.twodim twodim_3
+               Output: twodim_3."time", twodim_3."Color", twodim_3.temp
+               Data node: db_dist_hypertable_3
+               Chunks: _dist_hyper_7_20_chunk, _dist_hyper_7_23_chunk
+               Remote SQL: SELECT "time", "Color", temp FROM public.twodim WHERE _timescaledb_internal.chunks_in(public.twodim.*, ARRAY[10, 12]) ORDER BY "time" ASC NULLS LAST
+               Remote EXPLAIN: 
+                 Custom Scan (ChunkAppend) on public.twodim
+                   Output: twodim."time", twodim."Color", twodim.temp
+                   Order: twodim."time"
+                   Startup Exclusion: false
+                   Runtime Exclusion: false
+                   ->  Index Scan Backward using _dist_hyper_7_20_chunk_twodim_time_idx on _timescaledb_internal._dist_hyper_7_20_chunk
+                         Output: _dist_hyper_7_20_chunk."time", _dist_hyper_7_20_chunk."Color", _dist_hyper_7_20_chunk.temp
+                   ->  Index Scan Backward using _dist_hyper_7_23_chunk_twodim_time_idx on _timescaledb_internal._dist_hyper_7_23_chunk
+                         Output: _dist_hyper_7_23_chunk."time", _dist_hyper_7_23_chunk."Color", _dist_hyper_7_23_chunk.temp
+ 
+(56 rows)
+
+SET timescaledb.enable_remote_explain = OFF;
 -- Check results
 SELECT * FROM twodim
 ORDER BY time;
@@ -2684,18 +2958,18 @@ Tue Jan 01 01:02:00 2019 PST|ts-1-11-20-30|  2|abcabcabcabcabcabcab
 NOTICE:  [db_dist_hypertable_2]: 
 SELECT time, txn_id, val, substring(info for 20) FROM disttable_with_ct
 NOTICE:  [db_dist_hypertable_2]:
-time                        |txn_id       |val|substring           
-----------------------------+-------------+---+--------------------
-Tue Jan 01 01:02:00 2019 PST|ts-1-11-20-30|  2|abcabcabcabcabcabcab
-(1 row)
+time|txn_id|val|substring
+----+------+---+---------
+(0 rows)
 
 
 NOTICE:  [db_dist_hypertable_3]: 
 SELECT time, txn_id, val, substring(info for 20) FROM disttable_with_ct
 NOTICE:  [db_dist_hypertable_3]:
-time|txn_id|val|substring
-----+------+---+---------
-(0 rows)
+time                        |txn_id       |val|substring           
+----------------------------+-------------+---+--------------------
+Tue Jan 01 01:02:00 2019 PST|ts-1-11-20-30|  2|abcabcabcabcabcabcab
+(1 row)
 
 
  remote_exec 
@@ -2770,10 +3044,10 @@ FROM show_chunks('disttable_drop_chunks')
 NOTICE:  [db_dist_hypertable_2]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      16|            8|_timescaledb_internal|_dist_hyper_10_27_chunk|r      |{"time": [1482969600000000, 1483574400000000], "device": [-9223372036854775808, 715827882]}
-      17|            8|_timescaledb_internal|_dist_hyper_10_29_chunk|r      |{"time": [1482969600000000, 1483574400000000], "device": [715827882, 1431655764]}          
-      18|            8|_timescaledb_internal|_dist_hyper_10_30_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [-9223372036854775808, 715827882]}
-      19|            8|_timescaledb_internal|_dist_hyper_10_31_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [715827882, 1431655764]}          
+      15|            8|_timescaledb_internal|_dist_hyper_10_27_chunk|r      |{"time": [1482969600000000, 1483574400000000], "device": [-9223372036854775808, 715827882]}
+      16|            8|_timescaledb_internal|_dist_hyper_10_29_chunk|r      |{"time": [1482969600000000, 1483574400000000], "device": [715827882, 1431655764]}          
+      17|            8|_timescaledb_internal|_dist_hyper_10_30_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [-9223372036854775808, 715827882]}
+      18|            8|_timescaledb_internal|_dist_hyper_10_31_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [715827882, 1431655764]}          
 (4 rows)
 
 
@@ -2783,10 +3057,10 @@ FROM show_chunks('disttable_drop_chunks')
 NOTICE:  [db_dist_hypertable_3]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      14|            7|_timescaledb_internal|_dist_hyper_10_28_chunk|r      |{"time": [1482969600000000, 1483574400000000], "device": [1431655764, 9223372036854775807]}
-      15|            7|_timescaledb_internal|_dist_hyper_10_29_chunk|r      |{"time": [1482969600000000, 1483574400000000], "device": [715827882, 1431655764]}          
-      16|            7|_timescaledb_internal|_dist_hyper_10_31_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [715827882, 1431655764]}          
-      17|            7|_timescaledb_internal|_dist_hyper_10_32_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [1431655764, 9223372036854775807]}
+      15|            7|_timescaledb_internal|_dist_hyper_10_28_chunk|r      |{"time": [1482969600000000, 1483574400000000], "device": [1431655764, 9223372036854775807]}
+      16|            7|_timescaledb_internal|_dist_hyper_10_29_chunk|r      |{"time": [1482969600000000, 1483574400000000], "device": [715827882, 1431655764]}          
+      17|            7|_timescaledb_internal|_dist_hyper_10_31_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [715827882, 1431655764]}          
+      18|            7|_timescaledb_internal|_dist_hyper_10_32_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [1431655764, 9223372036854775807]}
 (4 rows)
 
 
@@ -2842,8 +3116,8 @@ FROM show_chunks('disttable_drop_chunks')
 NOTICE:  [db_dist_hypertable_2]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      18|            8|_timescaledb_internal|_dist_hyper_10_30_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [-9223372036854775808, 715827882]}
-      19|            8|_timescaledb_internal|_dist_hyper_10_31_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [715827882, 1431655764]}          
+      17|            8|_timescaledb_internal|_dist_hyper_10_30_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [-9223372036854775808, 715827882]}
+      18|            8|_timescaledb_internal|_dist_hyper_10_31_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [715827882, 1431655764]}          
 (2 rows)
 
 
@@ -2853,8 +3127,8 @@ FROM show_chunks('disttable_drop_chunks')
 NOTICE:  [db_dist_hypertable_3]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      16|            7|_timescaledb_internal|_dist_hyper_10_31_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [715827882, 1431655764]}          
-      17|            7|_timescaledb_internal|_dist_hyper_10_32_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [1431655764, 9223372036854775807]}
+      17|            7|_timescaledb_internal|_dist_hyper_10_31_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [715827882, 1431655764]}          
+      18|            7|_timescaledb_internal|_dist_hyper_10_32_chunk|r      |{"time": [1530144000000000, 1530748800000000], "device": [1431655764, 9223372036854775807]}
 (2 rows)
 
 
@@ -3082,6 +3356,8 @@ id|hypertable_id|column_name|column_type|aligned|num_slices|partitioning_func_sc
 
 -- Tests for using tablespaces with distributed hypertables
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
+--Ensure INSERTs use DataNodeDispatch.
+SET timescaledb.enable_distributed_insert_with_copy=false;
 CREATE TABLESPACE :TABLESPACE_1 OWNER :ROLE_1 LOCATION :'spc1path';
 CREATE TABLESPACE :TABLESPACE_2 OWNER :ROLE_1 LOCATION :'spc2path';
 \set ON_ERROR_STOP 0
@@ -3219,8 +3495,31 @@ SELECT * FROM dist_device;
    Output: dist_device."time", dist_device.dist_device, dist_device.temp
    Data node: db_dist_hypertable_1
    Chunks: _dist_hyper_15_37_chunk
-   Remote SQL: SELECT "time", dist_device, temp FROM public.dist_device WHERE _timescaledb_internal.chunks_in(public.dist_device.*, ARRAY[24])
+   Remote SQL: SELECT "time", dist_device, temp FROM public.dist_device WHERE _timescaledb_internal.chunks_in(public.dist_device.*, ARRAY[22])
 (5 rows)
+
+-- Check that datanodes use ChunkAppend plans with chunks_in function in the
+-- "Remote SQL" when only time partitioning is being used.
+SET timescaledb.enable_remote_explain = ON;
+EXPLAIN (VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT "time", dist_device, temp FROM public.dist_device ORDER BY "time" ASC NULLS LAST;
+                                                                                  QUERY PLAN                                                                                  
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (DataNodeScan) on public.dist_device
+   Output: dist_device."time", dist_device.dist_device, dist_device.temp
+   Data node: db_dist_hypertable_1
+   Chunks: _dist_hyper_15_37_chunk
+   Remote SQL: SELECT "time", dist_device, temp FROM public.dist_device WHERE _timescaledb_internal.chunks_in(public.dist_device.*, ARRAY[22]) ORDER BY "time" ASC NULLS LAST
+   Remote EXPLAIN: 
+     Custom Scan (ChunkAppend) on public.dist_device
+       Output: dist_device."time", dist_device.dist_device, dist_device.temp
+       Order: dist_device."time"
+       Startup Exclusion: false
+       Runtime Exclusion: false
+       ->  Index Scan Backward using _dist_hyper_15_37_chunk_dist_device_time_idx on _timescaledb_internal._dist_hyper_15_37_chunk
+             Output: _dist_hyper_15_37_chunk."time", _dist_hyper_15_37_chunk.dist_device, _dist_hyper_15_37_chunk.temp
+ 
+(14 rows)
 
 SELECT * FROM dist_device;
              time             | dist_device | temp 
@@ -3381,7 +3680,7 @@ ORDER BY 1;
 INSERT INTO devices VALUES (6, 'E999');
 \set ON_ERROR_STOP 0
 INSERT INTO hyper VALUES ('2017-01-01 06:01', 6, 1.1);
-ERROR:  [db_dist_hypertable_1]: insert or update on table "_dist_hyper_17_45_chunk" violates foreign key constraint "28_17_hyper_device_fkey"
+ERROR:  [db_dist_hypertable_1]: insert or update on table "_dist_hyper_17_45_chunk" violates foreign key constraint "26_17_hyper_device_fkey"
 \set ON_ERROR_STOP 1
 -- Test alter replication factor with data
 SELECT * FROM test.remote_exec(ARRAY[:'DATA_NODE_1', :'DATA_NODE_2', :'DATA_NODE_3'], $$
@@ -3394,9 +3693,9 @@ NOTICE:  [db_dist_hypertable_1]:
 NOTICE:  [db_dist_hypertable_1]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      28|           16|_timescaledb_internal|_dist_hyper_17_45_chunk|r      |{"time": [1483272000000000, 1483336800000000], "device": [-9223372036854775808, 715827882]}
-      29|           16|_timescaledb_internal|_dist_hyper_17_46_chunk|r      |{"time": [1483336800000000, 1483401600000000], "device": [-9223372036854775808, 715827882]}
-      30|           16|_timescaledb_internal|_dist_hyper_17_49_chunk|r      |{"time": [1515801600000000, 1515866400000000], "device": [-9223372036854775808, 715827882]}
+      26|           16|_timescaledb_internal|_dist_hyper_17_45_chunk|r      |{"time": [1483272000000000, 1483336800000000], "device": [-9223372036854775808, 715827882]}
+      27|           16|_timescaledb_internal|_dist_hyper_17_46_chunk|r      |{"time": [1483336800000000, 1483401600000000], "device": [-9223372036854775808, 715827882]}
+      28|           16|_timescaledb_internal|_dist_hyper_17_49_chunk|r      |{"time": [1515801600000000, 1515866400000000], "device": [-9223372036854775808, 715827882]}
 (3 rows)
 
 
@@ -3417,8 +3716,8 @@ NOTICE:  [db_dist_hypertable_3]:
 NOTICE:  [db_dist_hypertable_3]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      21|           14|_timescaledb_internal|_dist_hyper_17_48_chunk|r      |{"time": [1483401600000000, 1483466400000000], "device": [1431655764, 9223372036854775807]}
-      22|           14|_timescaledb_internal|_dist_hyper_17_51_chunk|r      |{"time": [1515866400000000, 1515931200000000], "device": [1431655764, 9223372036854775807]}
+      23|           14|_timescaledb_internal|_dist_hyper_17_48_chunk|r      |{"time": [1483401600000000, 1483466400000000], "device": [1431655764, 9223372036854775807]}
+      24|           14|_timescaledb_internal|_dist_hyper_17_51_chunk|r      |{"time": [1515866400000000, 1515931200000000], "device": [1431655764, 9223372036854775807]}
 (2 rows)
 
 
@@ -3445,9 +3744,9 @@ NOTICE:  [db_dist_hypertable_1]:
 NOTICE:  [db_dist_hypertable_1]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      28|           16|_timescaledb_internal|_dist_hyper_17_45_chunk|r      |{"time": [1483272000000000, 1483336800000000], "device": [-9223372036854775808, 715827882]}
-      29|           16|_timescaledb_internal|_dist_hyper_17_46_chunk|r      |{"time": [1483336800000000, 1483401600000000], "device": [-9223372036854775808, 715827882]}
-      30|           16|_timescaledb_internal|_dist_hyper_17_49_chunk|r      |{"time": [1515801600000000, 1515866400000000], "device": [-9223372036854775808, 715827882]}
+      26|           16|_timescaledb_internal|_dist_hyper_17_45_chunk|r      |{"time": [1483272000000000, 1483336800000000], "device": [-9223372036854775808, 715827882]}
+      27|           16|_timescaledb_internal|_dist_hyper_17_46_chunk|r      |{"time": [1483336800000000, 1483401600000000], "device": [-9223372036854775808, 715827882]}
+      28|           16|_timescaledb_internal|_dist_hyper_17_49_chunk|r      |{"time": [1515801600000000, 1515866400000000], "device": [-9223372036854775808, 715827882]}
 (3 rows)
 
 
@@ -3468,8 +3767,8 @@ NOTICE:  [db_dist_hypertable_3]:
 NOTICE:  [db_dist_hypertable_3]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      21|           14|_timescaledb_internal|_dist_hyper_17_48_chunk|r      |{"time": [1483401600000000, 1483466400000000], "device": [1431655764, 9223372036854775807]}
-      22|           14|_timescaledb_internal|_dist_hyper_17_51_chunk|r      |{"time": [1515866400000000, 1515931200000000], "device": [1431655764, 9223372036854775807]}
+      23|           14|_timescaledb_internal|_dist_hyper_17_48_chunk|r      |{"time": [1483401600000000, 1483466400000000], "device": [1431655764, 9223372036854775807]}
+      24|           14|_timescaledb_internal|_dist_hyper_17_51_chunk|r      |{"time": [1515866400000000, 1515931200000000], "device": [1431655764, 9223372036854775807]}
 (2 rows)
 
 
@@ -3489,10 +3788,10 @@ NOTICE:  [db_dist_hypertable_1]:
 NOTICE:  [db_dist_hypertable_1]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      28|           16|_timescaledb_internal|_dist_hyper_17_45_chunk|r      |{"time": [1483272000000000, 1483336800000000], "device": [-9223372036854775808, 715827882]}
-      29|           16|_timescaledb_internal|_dist_hyper_17_46_chunk|r      |{"time": [1483336800000000, 1483401600000000], "device": [-9223372036854775808, 715827882]}
-      30|           16|_timescaledb_internal|_dist_hyper_17_49_chunk|r      |{"time": [1515801600000000, 1515866400000000], "device": [-9223372036854775808, 715827882]}
-      31|           16|_timescaledb_internal|_dist_hyper_17_52_chunk|r      |{"time": [1485928800000000, 1485993600000000], "device": [-9223372036854775808, 715827882]}
+      26|           16|_timescaledb_internal|_dist_hyper_17_45_chunk|r      |{"time": [1483272000000000, 1483336800000000], "device": [-9223372036854775808, 715827882]}
+      27|           16|_timescaledb_internal|_dist_hyper_17_46_chunk|r      |{"time": [1483336800000000, 1483401600000000], "device": [-9223372036854775808, 715827882]}
+      28|           16|_timescaledb_internal|_dist_hyper_17_49_chunk|r      |{"time": [1515801600000000, 1515866400000000], "device": [-9223372036854775808, 715827882]}
+      29|           16|_timescaledb_internal|_dist_hyper_17_52_chunk|r      |{"time": [1485928800000000, 1485993600000000], "device": [-9223372036854775808, 715827882]}
 (4 rows)
 
 
@@ -3514,9 +3813,9 @@ NOTICE:  [db_dist_hypertable_3]:
 NOTICE:  [db_dist_hypertable_3]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      21|           14|_timescaledb_internal|_dist_hyper_17_48_chunk|r      |{"time": [1483401600000000, 1483466400000000], "device": [1431655764, 9223372036854775807]}
-      22|           14|_timescaledb_internal|_dist_hyper_17_51_chunk|r      |{"time": [1515866400000000, 1515931200000000], "device": [1431655764, 9223372036854775807]}
-      23|           14|_timescaledb_internal|_dist_hyper_17_52_chunk|r      |{"time": [1485928800000000, 1485993600000000], "device": [-9223372036854775808, 715827882]}
+      23|           14|_timescaledb_internal|_dist_hyper_17_48_chunk|r      |{"time": [1483401600000000, 1483466400000000], "device": [1431655764, 9223372036854775807]}
+      24|           14|_timescaledb_internal|_dist_hyper_17_51_chunk|r      |{"time": [1515866400000000, 1515931200000000], "device": [1431655764, 9223372036854775807]}
+      25|           14|_timescaledb_internal|_dist_hyper_17_52_chunk|r      |{"time": [1485928800000000, 1485993600000000], "device": [-9223372036854775808, 715827882]}
 (3 rows)
 
 
@@ -3543,11 +3842,11 @@ NOTICE:  [db_dist_hypertable_1]:
 NOTICE:  [db_dist_hypertable_1]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      28|           16|_timescaledb_internal|_dist_hyper_17_45_chunk|r      |{"time": [1483272000000000, 1483336800000000], "device": [-9223372036854775808, 715827882]}
-      29|           16|_timescaledb_internal|_dist_hyper_17_46_chunk|r      |{"time": [1483336800000000, 1483401600000000], "device": [-9223372036854775808, 715827882]}
-      30|           16|_timescaledb_internal|_dist_hyper_17_49_chunk|r      |{"time": [1515801600000000, 1515866400000000], "device": [-9223372036854775808, 715827882]}
-      31|           16|_timescaledb_internal|_dist_hyper_17_52_chunk|r      |{"time": [1485928800000000, 1485993600000000], "device": [-9223372036854775808, 715827882]}
-      32|           16|_timescaledb_internal|_dist_hyper_17_53_chunk|r      |{"time": [1488326400000000, 1488391200000000], "device": [-9223372036854775808, 715827882]}
+      26|           16|_timescaledb_internal|_dist_hyper_17_45_chunk|r      |{"time": [1483272000000000, 1483336800000000], "device": [-9223372036854775808, 715827882]}
+      27|           16|_timescaledb_internal|_dist_hyper_17_46_chunk|r      |{"time": [1483336800000000, 1483401600000000], "device": [-9223372036854775808, 715827882]}
+      28|           16|_timescaledb_internal|_dist_hyper_17_49_chunk|r      |{"time": [1515801600000000, 1515866400000000], "device": [-9223372036854775808, 715827882]}
+      29|           16|_timescaledb_internal|_dist_hyper_17_52_chunk|r      |{"time": [1485928800000000, 1485993600000000], "device": [-9223372036854775808, 715827882]}
+      30|           16|_timescaledb_internal|_dist_hyper_17_53_chunk|r      |{"time": [1488326400000000, 1488391200000000], "device": [-9223372036854775808, 715827882]}
 (5 rows)
 
 
@@ -3570,9 +3869,9 @@ NOTICE:  [db_dist_hypertable_3]:
 NOTICE:  [db_dist_hypertable_3]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      21|           14|_timescaledb_internal|_dist_hyper_17_48_chunk|r      |{"time": [1483401600000000, 1483466400000000], "device": [1431655764, 9223372036854775807]}
-      22|           14|_timescaledb_internal|_dist_hyper_17_51_chunk|r      |{"time": [1515866400000000, 1515931200000000], "device": [1431655764, 9223372036854775807]}
-      23|           14|_timescaledb_internal|_dist_hyper_17_52_chunk|r      |{"time": [1485928800000000, 1485993600000000], "device": [-9223372036854775808, 715827882]}
+      23|           14|_timescaledb_internal|_dist_hyper_17_48_chunk|r      |{"time": [1483401600000000, 1483466400000000], "device": [1431655764, 9223372036854775807]}
+      24|           14|_timescaledb_internal|_dist_hyper_17_51_chunk|r      |{"time": [1515866400000000, 1515931200000000], "device": [1431655764, 9223372036854775807]}
+      25|           14|_timescaledb_internal|_dist_hyper_17_52_chunk|r      |{"time": [1485928800000000, 1485993600000000], "device": [-9223372036854775808, 715827882]}
 (3 rows)
 
 
@@ -3599,11 +3898,11 @@ NOTICE:  [db_dist_hypertable_1]:
 NOTICE:  [db_dist_hypertable_1]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      28|           16|_timescaledb_internal|_dist_hyper_17_45_chunk|r      |{"time": [1483272000000000, 1483336800000000], "device": [-9223372036854775808, 715827882]}
-      29|           16|_timescaledb_internal|_dist_hyper_17_46_chunk|r      |{"time": [1483336800000000, 1483401600000000], "device": [-9223372036854775808, 715827882]}
-      30|           16|_timescaledb_internal|_dist_hyper_17_49_chunk|r      |{"time": [1515801600000000, 1515866400000000], "device": [-9223372036854775808, 715827882]}
-      31|           16|_timescaledb_internal|_dist_hyper_17_52_chunk|r      |{"time": [1485928800000000, 1485993600000000], "device": [-9223372036854775808, 715827882]}
-      32|           16|_timescaledb_internal|_dist_hyper_17_53_chunk|r      |{"time": [1488326400000000, 1488391200000000], "device": [-9223372036854775808, 715827882]}
+      26|           16|_timescaledb_internal|_dist_hyper_17_45_chunk|r      |{"time": [1483272000000000, 1483336800000000], "device": [-9223372036854775808, 715827882]}
+      27|           16|_timescaledb_internal|_dist_hyper_17_46_chunk|r      |{"time": [1483336800000000, 1483401600000000], "device": [-9223372036854775808, 715827882]}
+      28|           16|_timescaledb_internal|_dist_hyper_17_49_chunk|r      |{"time": [1515801600000000, 1515866400000000], "device": [-9223372036854775808, 715827882]}
+      29|           16|_timescaledb_internal|_dist_hyper_17_52_chunk|r      |{"time": [1485928800000000, 1485993600000000], "device": [-9223372036854775808, 715827882]}
+      30|           16|_timescaledb_internal|_dist_hyper_17_53_chunk|r      |{"time": [1488326400000000, 1488391200000000], "device": [-9223372036854775808, 715827882]}
 (5 rows)
 
 
@@ -3627,10 +3926,10 @@ NOTICE:  [db_dist_hypertable_3]:
 NOTICE:  [db_dist_hypertable_3]:
 chunk_id|hypertable_id|schema_name          |table_name             |relkind|slices                                                                                     
 --------+-------------+---------------------+-----------------------+-------+-------------------------------------------------------------------------------------------
-      21|           14|_timescaledb_internal|_dist_hyper_17_48_chunk|r      |{"time": [1483401600000000, 1483466400000000], "device": [1431655764, 9223372036854775807]}
-      22|           14|_timescaledb_internal|_dist_hyper_17_51_chunk|r      |{"time": [1515866400000000, 1515931200000000], "device": [1431655764, 9223372036854775807]}
-      23|           14|_timescaledb_internal|_dist_hyper_17_52_chunk|r      |{"time": [1485928800000000, 1485993600000000], "device": [-9223372036854775808, 715827882]}
-      24|           14|_timescaledb_internal|_dist_hyper_17_54_chunk|r      |{"time": [1491048000000000, 1491112800000000], "device": [715827882, 1431655764]}          
+      23|           14|_timescaledb_internal|_dist_hyper_17_48_chunk|r      |{"time": [1483401600000000, 1483466400000000], "device": [1431655764, 9223372036854775807]}
+      24|           14|_timescaledb_internal|_dist_hyper_17_51_chunk|r      |{"time": [1515866400000000, 1515931200000000], "device": [1431655764, 9223372036854775807]}
+      25|           14|_timescaledb_internal|_dist_hyper_17_52_chunk|r      |{"time": [1485928800000000, 1485993600000000], "device": [-9223372036854775808, 715827882]}
+      26|           14|_timescaledb_internal|_dist_hyper_17_54_chunk|r      |{"time": [1491048000000000, 1491112800000000], "device": [715827882, 1431655764]}          
 (4 rows)
 
 
@@ -3890,10 +4189,9 @@ NOTICE:  [db_dist_hypertable_1]:
     (SELECT (_timescaledb_internal.show_chunk(show_chunks)).table_name FROM show_chunks('disttable_with_relopts_2'))
     ORDER BY relname
 NOTICE:  [db_dist_hypertable_1]:
-relname                |reloptions                        
------------------------+----------------------------------
-_dist_hyper_19_57_chunk|{fillfactor=10,parallel_workers=1}
-(1 row)
+relname|reloptions
+-------+----------
+(0 rows)
 
 
 NOTICE:  [db_dist_hypertable_2]: 
@@ -3903,7 +4201,7 @@ NOTICE:  [db_dist_hypertable_2]:
 NOTICE:  [db_dist_hypertable_2]:
 relname                |reloptions                        
 -----------------------+----------------------------------
-_dist_hyper_19_58_chunk|{fillfactor=10,parallel_workers=1}
+_dist_hyper_19_57_chunk|{fillfactor=10,parallel_workers=1}
 (1 row)
 
 
@@ -3912,9 +4210,10 @@ NOTICE:  [db_dist_hypertable_3]:
     (SELECT (_timescaledb_internal.show_chunk(show_chunks)).table_name FROM show_chunks('disttable_with_relopts_2'))
     ORDER BY relname
 NOTICE:  [db_dist_hypertable_3]:
-relname|reloptions
--------+----------
-(0 rows)
+relname                |reloptions                        
+-----------------------+----------------------------------
+_dist_hyper_19_58_chunk|{fillfactor=10,parallel_workers=1}
+(1 row)
 
 
  remote_exec 
@@ -4566,3 +4865,360 @@ SET timescaledb.enable_per_data_node_queries = true;
 SELECT tableoid::regclass, * FROM dist_syscol;
 ERROR:  system columns are not accessible on distributed hypertables with current settings
 \set ON_ERROR_STOP 1
+-----------------------
+-- Test DataNodeCopy --
+-----------------------
+SET timescaledb.enable_distributed_insert_with_copy=true;
+DROP TABLE disttable;
+-- Add serial (autoincrement) and DEFAULT value columns to test that
+-- these work with DataNodeCopy
+CREATE TABLE disttable(
+    id serial,
+    time timestamptz NOT NULL,
+    device int DEFAULT 100,
+    temp_c float
+);
+SELECT * FROM create_distributed_hypertable('disttable', 'time', 'device');
+ hypertable_id | schema_name | table_name | created 
+---------------+-------------+------------+---------
+            27 | public      | disttable  | t
+(1 row)
+
+-- Create a datatable to source data from. Add array of composite data
+-- type to test switching to text mode below. Arrays include the type
+-- Oid when serialized in binary format. Since the Oid of a
+-- user-created type can differ across data nodes, such serialization
+-- is not safe.
+CREATE TABLE datatable (LIKE disttable);
+CREATE TYPE highlow AS (high int, low int);
+CALL distributed_exec($$ CREATE TYPE highlow AS (high int, low int) $$);
+ALTER TABLE datatable ADD COLUMN minmaxes highlow[];
+INSERT INTO datatable (id, time, device, temp_c, minmaxes) VALUES
+       (1, '2017-01-01 06:01', 1, 1.2, ARRAY[(1,2)::highlow]),
+       (2, '2017-01-01 09:11', 3, 4.3, ARRAY[(2,3)::highlow]),
+       (3, '2017-01-01 08:01', 1, 7.3, ARRAY[(4,5)::highlow]),
+       (4, '2017-01-02 08:01', 2, 0.23, ARRAY[(6,7)::highlow]),
+       (5, '2018-07-02 08:01', 87, 0.0, ARRAY[(8,9)::highlow]),
+       (6, '2018-07-01 06:01', 13, 3.1, ARRAY[(10,11)::highlow]),
+       (7, '2018-07-01 09:11', 90, 10303.12, ARRAY[(12,13)::highlow]),
+       (8, '2018-07-01 08:01', 29, 64, ARRAY[(14,15)::highlow]);
+-- Show that DataNodeCopy is used instead of DataNodeDispatch. Should
+-- default to FORMAT binary in the remote SQL. Add RETURNING to show
+-- that it works.
+EXPLAIN VERBOSE
+INSERT INTO disttable (time, device, temp_c)
+SELECT time, device, temp_c FROM datatable
+RETURNING *;
+                                                              QUERY PLAN                                                              
+--------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (HypertableInsert)  (cost=0.00..24.55 rows=970 width=24)
+   Output: disttable.id, disttable."time", disttable.device, disttable.temp_c
+ Insert on distributed hypertable public.disttable
+   Data nodes: db_dist_hypertable_1, db_dist_hypertable_2, db_dist_hypertable_3
+   ->  Insert on public.disttable  (cost=0.00..24.55 rows=970 width=24)
+         Output: disttable.id, disttable."time", disttable.device, disttable.temp_c
+         ->  Custom Scan (DataNodeCopy)  (cost=0.00..24.55 rows=970 width=24)
+               Output: ((nextval('disttable_id_seq'::regclass))::integer), datatable."time", datatable.device, datatable.temp_c
+               Remote SQL: COPY public.disttable (id, "time", device, temp_c) FROM STDIN WITH (FORMAT binary)
+               ->  Custom Scan (ChunkDispatch)  (cost=0.00..24.55 rows=970 width=24)
+                     Output: ((nextval('disttable_id_seq'::regclass))::integer), datatable."time", datatable.device, datatable.temp_c
+                     ->  Seq Scan on public.datatable  (cost=0.00..24.55 rows=970 width=24)
+                           Output: nextval('disttable_id_seq'::regclass), datatable."time", datatable.device, datatable.temp_c
+(13 rows)
+
+-- Perform the actual insert
+INSERT INTO disttable (time, device, temp_c)
+SELECT time, device, temp_c FROM datatable
+RETURNING *;
+ id |             time             | device |  temp_c  
+----+------------------------------+--------+----------
+  1 | Sun Jan 01 06:01:00 2017 PST |      1 |      1.2
+  2 | Sun Jan 01 09:11:00 2017 PST |      3 |      4.3
+  3 | Sun Jan 01 08:01:00 2017 PST |      1 |      7.3
+  4 | Mon Jan 02 08:01:00 2017 PST |      2 |     0.23
+  5 | Mon Jul 02 08:01:00 2018 PDT |     87 |        0
+  6 | Sun Jul 01 06:01:00 2018 PDT |     13 |      3.1
+  7 | Sun Jul 01 09:11:00 2018 PDT |     90 | 10303.12
+  8 | Sun Jul 01 08:01:00 2018 PDT |     29 |       64
+(8 rows)
+
+-- Show that the data was added:
+SELECT * FROM disttable ORDER BY 1;
+ id |             time             | device |  temp_c  
+----+------------------------------+--------+----------
+  1 | Sun Jan 01 06:01:00 2017 PST |      1 |      1.2
+  2 | Sun Jan 01 09:11:00 2017 PST |      3 |      4.3
+  3 | Sun Jan 01 08:01:00 2017 PST |      1 |      7.3
+  4 | Mon Jan 02 08:01:00 2017 PST |      2 |     0.23
+  5 | Mon Jul 02 08:01:00 2018 PDT |     87 |        0
+  6 | Sun Jul 01 06:01:00 2018 PDT |     13 |      3.1
+  7 | Sun Jul 01 09:11:00 2018 PDT |     90 | 10303.12
+  8 | Sun Jul 01 08:01:00 2018 PDT |     29 |       64
+(8 rows)
+
+SELECT count(*) FROM disttable;
+ count 
+-------
+     8
+(1 row)
+
+-- Add an array of a composite type to check that DataNodeCopy
+-- switches to text format if we use a table with an array of a custom
+-- type. There should be no "FORMAT binary" in the remote explain.
+ALTER TABLE disttable ADD COLUMN minmaxes highlow[];
+EXPLAIN VERBOSE
+INSERT INTO disttable (time, device, temp_c, minmaxes)
+SELECT time, device, temp_c, minmaxes FROM datatable;
+                                                                        QUERY PLAN                                                                        
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (HypertableInsert)  (cost=0.00..24.55 rows=970 width=56)
+ Insert on distributed hypertable public.disttable
+   Data nodes: db_dist_hypertable_1, db_dist_hypertable_2, db_dist_hypertable_3
+   ->  Insert on public.disttable  (cost=0.00..24.55 rows=970 width=56)
+         ->  Custom Scan (DataNodeCopy)  (cost=0.00..24.55 rows=970 width=56)
+               Output: ((nextval('disttable_id_seq'::regclass))::integer), datatable."time", datatable.device, datatable.temp_c, datatable.minmaxes
+               Remote SQL: COPY public.disttable (id, "time", device, temp_c, minmaxes) FROM STDIN
+               ->  Custom Scan (ChunkDispatch)  (cost=0.00..24.55 rows=970 width=56)
+                     Output: ((nextval('disttable_id_seq'::regclass))::integer), datatable."time", datatable.device, datatable.temp_c, datatable.minmaxes
+                     ->  Seq Scan on public.datatable  (cost=0.00..24.55 rows=970 width=56)
+                           Output: nextval('disttable_id_seq'::regclass), datatable."time", datatable.device, datatable.temp_c, datatable.minmaxes
+(11 rows)
+
+INSERT INTO disttable (time, device, temp_c, minmaxes)
+SELECT time, device, temp_c, minmaxes FROM datatable;
+-- Should have double amount of rows compared to before and half of
+-- them values in the new column.  Note, must use TEXT format on the
+-- connection to make query work with custom type array.
+SET timescaledb.enable_connection_binary_data=false;
+SELECT * FROM disttable ORDER BY 1;
+ id |             time             | device |  temp_c  |  minmaxes   
+----+------------------------------+--------+----------+-------------
+  1 | Sun Jan 01 06:01:00 2017 PST |      1 |      1.2 | 
+  2 | Sun Jan 01 09:11:00 2017 PST |      3 |      4.3 | 
+  3 | Sun Jan 01 08:01:00 2017 PST |      1 |      7.3 | 
+  4 | Mon Jan 02 08:01:00 2017 PST |      2 |     0.23 | 
+  5 | Mon Jul 02 08:01:00 2018 PDT |     87 |        0 | 
+  6 | Sun Jul 01 06:01:00 2018 PDT |     13 |      3.1 | 
+  7 | Sun Jul 01 09:11:00 2018 PDT |     90 | 10303.12 | 
+  8 | Sun Jul 01 08:01:00 2018 PDT |     29 |       64 | 
+  9 | Sun Jan 01 06:01:00 2017 PST |      1 |      1.2 | {"(1,2)"}
+ 10 | Sun Jan 01 09:11:00 2017 PST |      3 |      4.3 | {"(2,3)"}
+ 11 | Sun Jan 01 08:01:00 2017 PST |      1 |      7.3 | {"(4,5)"}
+ 12 | Mon Jan 02 08:01:00 2017 PST |      2 |     0.23 | {"(6,7)"}
+ 13 | Mon Jul 02 08:01:00 2018 PDT |     87 |        0 | {"(8,9)"}
+ 14 | Sun Jul 01 06:01:00 2018 PDT |     13 |      3.1 | {"(10,11)"}
+ 15 | Sun Jul 01 09:11:00 2018 PDT |     90 | 10303.12 | {"(12,13)"}
+ 16 | Sun Jul 01 08:01:00 2018 PDT |     29 |       64 | {"(14,15)"}
+(16 rows)
+
+SELECT count(*) FROM disttable;
+ count 
+-------
+    16
+(1 row)
+
+-- REMOVE a column on data nodes to check how errors are handled:
+CALL distributed_exec($$ ALTER TABLE disttable DROP COLUMN minmaxes $$);
+\set ON_ERROR_STOP 0
+INSERT INTO disttable SELECT * FROM datatable;
+ERROR:  [db_dist_hypertable_1]: column "minmaxes" of relation "disttable" does not exist
+\set ON_ERROR_STOP 1
+DROP TABLE disttable;
+-- Create a new table access method by reusing heap handler
+CREATE ACCESS METHOD test_am TYPE TABLE HANDLER heap_tableam_handler;
+SELECT * FROM test.remote_exec(ARRAY[:'DATA_NODE_1', :'DATA_NODE_2', :'DATA_NODE_3'], $$
+CREATE ACCESS METHOD test_am TYPE TABLE HANDLER heap_tableam_handler;
+$$);
+NOTICE:  [db_dist_hypertable_1]: 
+CREATE ACCESS METHOD test_am TYPE TABLE HANDLER heap_tableam_handler
+NOTICE:  [db_dist_hypertable_2]: 
+CREATE ACCESS METHOD test_am TYPE TABLE HANDLER heap_tableam_handler
+NOTICE:  [db_dist_hypertable_3]: 
+CREATE ACCESS METHOD test_am TYPE TABLE HANDLER heap_tableam_handler
+ remote_exec 
+-------------
+ 
+(1 row)
+
+-- Create distributed hypertable using non-default access method
+CREATE TABLE disttable(time timestamptz NOT NULL, device int, temp_c float, temp_f float GENERATED ALWAYS AS (temp_c * 9 / 5 + 32) STORED) USING test_am;
+SELECT * FROM create_distributed_hypertable('disttable', 'time', 'device', 3);
+ hypertable_id | schema_name | table_name | created 
+---------------+-------------+------------+---------
+            28 | public      | disttable  | t
+(1 row)
+
+-- Make sure that distributed hypertable created on data nodes is
+-- using the correct table access method
+SELECT * FROM test.remote_exec(ARRAY[:'DATA_NODE_1', :'DATA_NODE_2', :'DATA_NODE_3'], $$
+
+SELECT amname AS hypertable_amname
+FROM pg_class cl, pg_am am
+WHERE cl.oid = 'disttable'::regclass
+AND cl.relam = am.oid;
+$$);
+NOTICE:  [db_dist_hypertable_1]: 
+
+SELECT amname AS hypertable_amname
+FROM pg_class cl, pg_am am
+WHERE cl.oid = 'disttable'::regclass
+AND cl.relam = am.oid
+NOTICE:  [db_dist_hypertable_1]:
+hypertable_amname
+-----------------
+test_am          
+(1 row)
+
+
+NOTICE:  [db_dist_hypertable_2]: 
+
+SELECT amname AS hypertable_amname
+FROM pg_class cl, pg_am am
+WHERE cl.oid = 'disttable'::regclass
+AND cl.relam = am.oid
+NOTICE:  [db_dist_hypertable_2]:
+hypertable_amname
+-----------------
+test_am          
+(1 row)
+
+
+NOTICE:  [db_dist_hypertable_3]: 
+
+SELECT amname AS hypertable_amname
+FROM pg_class cl, pg_am am
+WHERE cl.oid = 'disttable'::regclass
+AND cl.relam = am.oid
+NOTICE:  [db_dist_hypertable_3]:
+hypertable_amname
+-----------------
+test_am          
+(1 row)
+
+
+ remote_exec 
+-------------
+ 
+(1 row)
+
+-- Check that basic operations are working as expected
+INSERT INTO disttable VALUES
+       ('2017-01-01 06:01', 1, -10.0),
+       ('2017-01-01 09:11', 3, -5.0),
+       ('2017-01-01 08:01', 1, 1.0),
+       ('2017-01-02 08:01', 2, 5.0),
+       ('2018-07-02 08:01', 87, 10.0),
+       ('2018-07-01 06:01', 13, 15.0),
+       ('2018-07-01 09:11', 90, 20.0),
+       ('2018-07-01 08:01', 29, 24.0);
+SELECT * FROM disttable ORDER BY time;
+             time             | device | temp_c | temp_f 
+------------------------------+--------+--------+--------
+ Sun Jan 01 06:01:00 2017 PST |      1 |    -10 |     14
+ Sun Jan 01 08:01:00 2017 PST |      1 |      1 |   33.8
+ Sun Jan 01 09:11:00 2017 PST |      3 |     -5 |     23
+ Mon Jan 02 08:01:00 2017 PST |      2 |      5 |     41
+ Sun Jul 01 06:01:00 2018 PDT |     13 |     15 |     59
+ Sun Jul 01 08:01:00 2018 PDT |     29 |     24 |   75.2
+ Sun Jul 01 09:11:00 2018 PDT |     90 |     20 |     68
+ Mon Jul 02 08:01:00 2018 PDT |     87 |     10 |     50
+(8 rows)
+
+-- Show that GENERATED columns work for INSERT with RETURNING clause
+-- (should use DataNodeCopy)
+TRUNCATE disttable;
+EXPLAIN VERBOSE
+INSERT INTO disttable VALUES ('2017-08-01 06:01', 1, 35.0) RETURNING *;
+                                                                  QUERY PLAN                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (HypertableInsert)  (cost=0.00..0.01 rows=1 width=28)
+   Output: disttable."time", disttable.device, disttable.temp_c, disttable.temp_f
+ Insert on distributed hypertable public.disttable
+   Data nodes: db_dist_hypertable_1, db_dist_hypertable_2, db_dist_hypertable_3
+   ->  Insert on public.disttable  (cost=0.00..0.01 rows=1 width=28)
+         Output: disttable."time", disttable.device, disttable.temp_c, disttable.temp_f
+         ->  Custom Scan (DataNodeCopy)  (cost=0.00..0.01 rows=1 width=28)
+               Output: 'Tue Aug 01 06:01:00 2017 PDT'::timestamp with time zone, 1, '35'::double precision, NULL::double precision
+               Remote SQL: COPY public.disttable ("time", device, temp_c) FROM STDIN
+               ->  Custom Scan (ChunkDispatch)  (cost=0.00..0.01 rows=1 width=28)
+                     Output: 'Tue Aug 01 06:01:00 2017 PDT'::timestamp with time zone, 1, '35'::double precision, NULL::double precision
+                     ->  Result  (cost=0.00..0.01 rows=1 width=28)
+                           Output: 'Tue Aug 01 06:01:00 2017 PDT'::timestamp with time zone, 1, '35'::double precision, NULL::double precision
+(13 rows)
+
+INSERT INTO disttable VALUES ('2017-08-01 06:01', 1, 35.0) RETURNING *;
+             time             | device | temp_c | temp_f 
+------------------------------+--------+--------+--------
+ Tue Aug 01 06:01:00 2017 PDT |      1 |     35 |     95
+(1 row)
+
+-- Same values returned with SELECT:
+SELECT * FROM disttable ORDER BY 1;
+             time             | device | temp_c | temp_f 
+------------------------------+--------+--------+--------
+ Tue Aug 01 06:01:00 2017 PDT |      1 |     35 |     95
+(1 row)
+
+UPDATE disttable SET temp_c=40.0 WHERE device=1;
+SELECT * FROM disttable ORDER BY 1;
+             time             | device | temp_c | temp_f 
+------------------------------+--------+--------+--------
+ Tue Aug 01 06:01:00 2017 PDT |      1 |     40 |    104
+(1 row)
+
+-- Insert another value
+INSERT INTO disttable VALUES ('2017-09-01 06:01', 2, 30.0);
+SELECT * FROM disttable ORDER BY 1;
+             time             | device | temp_c | temp_f 
+------------------------------+--------+--------+--------
+ Tue Aug 01 06:01:00 2017 PDT |      1 |     40 |    104
+ Fri Sep 01 06:01:00 2017 PDT |      2 |     30 |     86
+(2 rows)
+
+-- Delete a value based on the generated column
+DELETE FROM disttable WHERE temp_f=104;
+SELECT * FROM disttable ORDER BY 1;
+             time             | device | temp_c | temp_f 
+------------------------------+--------+--------+--------
+ Fri Sep 01 06:01:00 2017 PDT |      2 |     30 |     86
+(1 row)
+
+-- Test also with DataNodeDispatch
+TRUNCATE disttable;
+SET timescaledb.enable_distributed_insert_with_copy=false;
+EXPLAIN VERBOSE
+INSERT INTO disttable VALUES ('2017-09-01 06:01', 5, 40.0) RETURNING *;
+                                                                               QUERY PLAN                                                                                
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (HypertableInsert)  (cost=0.00..0.01 rows=1 width=28)
+   Output: disttable."time", disttable.device, disttable.temp_c, disttable.temp_f
+ Insert on distributed hypertable public.disttable
+   Data nodes: db_dist_hypertable_1, db_dist_hypertable_2, db_dist_hypertable_3
+   ->  Insert on public.disttable  (cost=0.00..0.01 rows=1 width=28)
+         Output: disttable."time", disttable.device, disttable.temp_c, disttable.temp_f
+         ->  Custom Scan (DataNodeDispatch)  (cost=0.00..0.01 rows=1 width=28)
+               Output: 'Fri Sep 01 06:01:00 2017 PDT'::timestamp with time zone, 5, '40'::double precision, NULL::double precision
+               Batch size: 1000
+               Remote SQL: INSERT INTO public.disttable("time", device, temp_c) VALUES ($1, $2, $3), ..., ($2998, $2999, $3000) RETURNING "time", device, temp_c, temp_f
+               ->  Custom Scan (ChunkDispatch)  (cost=0.00..0.01 rows=1 width=28)
+                     Output: 'Fri Sep 01 06:01:00 2017 PDT'::timestamp with time zone, 5, '40'::double precision, NULL::double precision
+                     ->  Result  (cost=0.00..0.01 rows=1 width=28)
+                           Output: 'Fri Sep 01 06:01:00 2017 PDT'::timestamp with time zone, 5, '40'::double precision, NULL::double precision
+(14 rows)
+
+INSERT INTO disttable VALUES ('2017-09-01 06:01', 5, 40.0) RETURNING *;
+             time             | device | temp_c | temp_f 
+------------------------------+--------+--------+--------
+ Fri Sep 01 06:01:00 2017 PDT |      5 |     40 |    104
+(1 row)
+
+-- Generated columns with SELECT
+SELECT * FROM disttable ORDER BY 1;
+             time             | device | temp_c | temp_f 
+------------------------------+--------+--------+--------
+ Fri Sep 01 06:01:00 2017 PDT |      5 |     40 |    104
+(1 row)
+
+DROP DATABASE :DATA_NODE_1;
+DROP DATABASE :DATA_NODE_2;
+DROP DATABASE :DATA_NODE_3;

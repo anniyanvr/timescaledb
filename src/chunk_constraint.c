@@ -75,36 +75,35 @@ chunk_constraints_expand(ChunkConstraints *ccs, int16 new_capacity)
 
 	old = MemoryContextSwitchTo(ccs->mctx);
 	ccs->capacity = new_capacity;
+	Assert(ccs->constraints); /* repalloc() does not work with NULL argument */
 	ccs->constraints = repalloc(ccs->constraints, CHUNK_CONSTRAINTS_SIZE(new_capacity));
 	MemoryContextSwitchTo(old);
 }
 
 static void
-chunk_constraint_choose_name(Name dst, bool is_dimension, int32 dimension_slice_id,
-							 const char *hypertable_constraint_name, int32 chunk_id)
+chunk_constraint_dimension_choose_name(Name dst, int32 dimension_slice_id)
 {
-	if (is_dimension)
-	{
-		snprintf(NameStr(*dst), NAMEDATALEN, "constraint_%d", dimension_slice_id);
-	}
-	else
-	{
-		char constrname[100];
-		CatalogSecurityContext sec_ctx;
+	snprintf(NameStr(*dst), NAMEDATALEN, "constraint_%d", dimension_slice_id);
+}
 
-		Assert(hypertable_constraint_name != NULL);
+static void
+chunk_constraint_choose_name(Name dst, const char *hypertable_constraint_name, int32 chunk_id)
+{
+	char constrname[NAMEDATALEN];
+	CatalogSecurityContext sec_ctx;
 
-		ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
-		snprintf(constrname,
-				 100,
-				 "%d_" INT64_FORMAT "_%s",
-				 chunk_id,
-				 ts_catalog_table_next_seq_id(ts_catalog_get(), CHUNK_CONSTRAINT),
-				 hypertable_constraint_name);
-		ts_catalog_restore_user(&sec_ctx);
+	Assert(hypertable_constraint_name != NULL);
 
-		namestrcpy(dst, constrname);
-	}
+	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
+	snprintf(constrname,
+			 NAMEDATALEN,
+			 "%d_" INT64_FORMAT "_%s",
+			 chunk_id,
+			 ts_catalog_table_next_seq_id(ts_catalog_get(), CHUNK_CONSTRAINT),
+			 hypertable_constraint_name);
+	ts_catalog_restore_user(&sec_ctx);
+
+	namestrcpy(dst, constrname);
 }
 
 static ChunkConstraint *
@@ -120,14 +119,16 @@ chunk_constraints_add(ChunkConstraints *ccs, int32 chunk_id, int32 dimension_sli
 
 	if (NULL == constraint_name)
 	{
-		chunk_constraint_choose_name(&cc->fd.constraint_name,
-									 is_dimension_constraint(cc),
-									 cc->fd.dimension_slice_id,
-									 hypertable_constraint_name,
-									 cc->fd.chunk_id);
-
 		if (is_dimension_constraint(cc))
+		{
+			chunk_constraint_dimension_choose_name(&cc->fd.constraint_name,
+												   cc->fd.dimension_slice_id);
 			namestrcpy(&cc->fd.hypertable_constraint_name, "");
+		}
+		else
+			chunk_constraint_choose_name(&cc->fd.constraint_name,
+										 hypertable_constraint_name,
+										 cc->fd.chunk_id);
 	}
 	else
 		namestrcpy(&cc->fd.constraint_name, constraint_name);
@@ -142,7 +143,7 @@ chunk_constraints_add(ChunkConstraints *ccs, int32 chunk_id, int32 dimension_sli
 }
 
 static void
-chunk_constraint_fill_tuple_values(ChunkConstraint *cc, Datum values[Natts_chunk_constraint],
+chunk_constraint_fill_tuple_values(const ChunkConstraint *cc, Datum values[Natts_chunk_constraint],
 								   bool nulls[Natts_chunk_constraint])
 {
 	memset(values, 0, sizeof(Datum) * Natts_chunk_constraint);
@@ -162,7 +163,7 @@ chunk_constraint_fill_tuple_values(ChunkConstraint *cc, Datum values[Natts_chunk
 }
 
 static void
-chunk_constraint_insert_relation(Relation rel, ChunkConstraint *cc)
+chunk_constraint_insert_relation(const Relation rel, const ChunkConstraint *cc)
 {
 	TupleDesc desc = RelationGetDescr(rel);
 	Datum values[Natts_chunk_constraint];
@@ -176,7 +177,7 @@ chunk_constraint_insert_relation(Relation rel, ChunkConstraint *cc)
  * Insert multiple chunk constraints into the metadata catalog.
  */
 void
-ts_chunk_constraints_insert_metadata(ChunkConstraints *ccs)
+ts_chunk_constraints_insert_metadata(const ChunkConstraints *ccs)
 {
 	Catalog *catalog = ts_catalog_get();
 	CatalogSecurityContext sec_ctx;
@@ -260,7 +261,7 @@ chunk_constraints_add_from_tuple(ChunkConstraints *ccs, TupleInfo *ti)
  * Add a constraint to a chunk table.
  */
 static Oid
-chunk_constraint_create_on_table(ChunkConstraint *cc, Oid chunk_oid)
+chunk_constraint_create_on_table(const ChunkConstraint *cc, Oid chunk_oid)
 {
 	HeapTuple tuple;
 	Datum values[Natts_chunk_constraint];
@@ -286,8 +287,8 @@ chunk_constraint_create_on_table(ChunkConstraint *cc, Oid chunk_oid)
  * the catalog.
  */
 static Oid
-chunk_constraint_create(ChunkConstraint *cc, Oid chunk_oid, int32 chunk_id, Oid hypertable_oid,
-						int32 hypertable_id)
+chunk_constraint_create(const ChunkConstraint *cc, Oid chunk_oid, int32 chunk_id,
+						Oid hypertable_oid, int32 hypertable_id)
 {
 	Oid chunk_constraint_oid;
 
@@ -333,7 +334,7 @@ chunk_constraint_create(ChunkConstraint *cc, Oid chunk_oid, int32 chunk_id, Oid 
  * Create a set of constraints on a chunk table.
  */
 void
-ts_chunk_constraints_create(ChunkConstraints *ccs, Oid chunk_oid, int32 chunk_id,
+ts_chunk_constraints_create(const ChunkConstraints *ccs, Oid chunk_oid, int32 chunk_id,
 							Oid hypertable_oid, int32 hypertable_id)
 {
 	int i;
@@ -432,7 +433,7 @@ typedef struct ChunkConstraintScanData
  * constraints are saved in the chunk scan context.
  */
 int
-ts_chunk_constraint_scan_by_dimension_slice(DimensionSlice *slice, ChunkScanCtx *ctx,
+ts_chunk_constraint_scan_by_dimension_slice(const DimensionSlice *slice, ChunkScanCtx *ctx,
 											MemoryContext mctx)
 {
 	ScanIterator iterator = ts_scan_iterator_create(CHUNK_CONSTRAINT, AccessShareLock, mctx);
@@ -441,7 +442,7 @@ ts_chunk_constraint_scan_by_dimension_slice(DimensionSlice *slice, ChunkScanCtx 
 	init_scan_by_dimension_slice_id(&iterator, slice->fd.id);
 	ts_scanner_foreach(&iterator)
 	{
-		Hyperspace *hs = ctx->space;
+		const Hyperspace *hs = ctx->space;
 		ChunkStub *stub;
 		ChunkScanEntry *entry;
 		bool found;
@@ -493,7 +494,7 @@ ts_chunk_constraint_scan_by_dimension_slice(DimensionSlice *slice, ChunkScanCtx 
  * in a list, which is easier to traverse and provides deterministic chunk selection.
  */
 int
-ts_chunk_constraint_scan_by_dimension_slice_to_list(DimensionSlice *slice, List **list,
+ts_chunk_constraint_scan_by_dimension_slice_to_list(const DimensionSlice *slice, List **list,
 													MemoryContext mctx)
 {
 	ScanIterator iterator = ts_scan_iterator_create(CHUNK_CONSTRAINT, AccessShareLock, mctx);
@@ -568,7 +569,7 @@ chunk_constraint_need_on_chunk(const char chunk_relkind, Form_pg_constraint conf
 
 int
 ts_chunk_constraints_add_dimension_constraints(ChunkConstraints *ccs, int32 chunk_id,
-											   Hypercube *cube)
+											   const Hypercube *cube)
 {
 	int i;
 
@@ -615,7 +616,7 @@ ts_chunk_constraints_add_inheritable_constraints(ChunkConstraints *ccs, int32 ch
 }
 
 void
-ts_chunk_constraint_create_on_chunk(Chunk *chunk, Oid constraint_oid)
+ts_chunk_constraint_create_on_chunk(const Chunk *chunk, Oid constraint_oid)
 {
 	HeapTuple tuple;
 	Form_pg_constraint con;
@@ -792,7 +793,7 @@ ts_chunk_constraint_delete_by_dimension_slice_id(int32 dimension_slice_id)
 }
 
 void
-ts_chunk_constraint_recreate(ChunkConstraint *cc, Oid chunk_oid)
+ts_chunk_constraint_recreate(const ChunkConstraint *cc, Oid chunk_oid)
 {
 	ObjectAddress constrobj = {
 		.classId = ConstraintRelationId,
@@ -837,7 +838,7 @@ chunk_constraint_rename_hypertable_from_tuple(TupleInfo *ti, const char *newname
 
 	chunk_id = DatumGetInt32(values[AttrNumberGetAttrOffset(Anum_chunk_constraint_chunk_id)]);
 	namestrcpy(&new_hypertable_constraint_name, newname);
-	chunk_constraint_choose_name(&new_chunk_constraint_name, false, 0, newname, chunk_id);
+	chunk_constraint_choose_name(&new_chunk_constraint_name, newname, chunk_id);
 
 	values[AttrNumberGetAttrOffset(Anum_chunk_constraint_hypertable_constraint_name)] =
 		NameGetDatum(&new_hypertable_constraint_name);

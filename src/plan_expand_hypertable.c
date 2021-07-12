@@ -12,6 +12,7 @@
 #include <nodes/nodeFuncs.h>
 #include <nodes/plannodes.h>
 #include <optimizer/cost.h>
+#include <optimizer/optimizer.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/prep.h>
 #include <optimizer/restrictinfo.h>
@@ -24,16 +25,8 @@
 #include <utils/fmgrprotos.h>
 #include <utils/syscache.h>
 
-#include "compat.h"
-
-#if PG11
-#include <optimizer/clauses.h>
-#include <optimizer/var.h>
-#else
-#include <optimizer/optimizer.h>
-#endif
-
 #include "chunk.h"
+#include "compat.h"
 #include "cross_module_fn.h"
 #include "guc.h"
 #include "extension.h"
@@ -97,13 +90,16 @@ is_time_bucket_function(Expr *node)
 	return false;
 }
 
-#if PG13_GE
-/* PG13 merged setup_append_rel_array with setup_simple_rel_arrays */
 static void
-setup_append_rel_array(PlannerInfo *root)
+ts_setup_append_rel_array(PlannerInfo *root)
 {
-	root->append_rel_array =
-		repalloc(root->append_rel_array, root->simple_rel_array_size * sizeof(AppendRelInfo *));
+	/* repalloc() does not work with NULL argument */
+	if (root->append_rel_array)
+		root->append_rel_array =
+			repalloc(root->append_rel_array, root->simple_rel_array_size * sizeof(AppendRelInfo *));
+	else
+		root->append_rel_array = palloc(root->simple_rel_array_size * sizeof(AppendRelInfo *));
+
 	ListCell *lc;
 	foreach (lc, root->append_rel_list)
 	{
@@ -113,7 +109,6 @@ setup_append_rel_array(PlannerInfo *root)
 		root->append_rel_array[child_relid] = appinfo;
 	}
 }
-#endif
 
 /*
  * Pre-check to determine if an expression is eligible for constification.
@@ -605,7 +600,7 @@ process_quals(Node *quals, CollectQualCtx *ctx, bool is_outer_join)
 		 prev = lc, lc = lnext_compat((List *) quals, lc))
 	{
 		Expr *qual = lfirst(lc);
-		Relids relids = pull_varnos((Node *) qual);
+		Relids relids = pull_varnos_compat(ctx->root, (Node *) qual);
 		int num_rels = bms_num_members(relids);
 
 		/* stop processing if not for current rel */
@@ -625,15 +620,6 @@ process_quals(Node *quals, CollectQualCtx *ctx, bool is_outer_join)
 
 			ctx->chunk_exclusion_func = func_expr;
 			ctx->restrictions = NIL;
-			/* In PG12 removing the chunk_exclusion function here causes issues
-			 * when the first/last optimization fires, as those subqueries
-			 * will not see the function. Fortunately, in pg12 we do not the
-			 * baserestrictinfo is already populated by the time this function
-			 * is called, so we can remove the functions from that directly
-			 */
-#if PG12_LT
-			quals = (Node *) list_delete_cell_compat((List *) quals, lc, prev);
-#endif
 			return quals;
 		}
 
@@ -675,12 +661,12 @@ process_quals(Node *quals, CollectQualCtx *ctx, bool is_outer_join)
 		 * the restriction would exclude chunks and thus rows of the outer
 		 * relation when it should show all rows */
 		if (!is_outer_join)
-			ctx->restrictions = lappend(ctx->restrictions, make_simple_restrictinfo(qual));
+			ctx->restrictions =
+				lappend(ctx->restrictions, make_simple_restrictinfo_compat(ctx->root, qual));
 	}
 	return (Node *) list_concat((List *) quals, additional_quals);
 }
 
-#if PG12_GE
 static List *
 remove_exclusion_fns(List *restrictinfo)
 {
@@ -715,7 +701,6 @@ remove_exclusion_fns(List *restrictinfo)
 	}
 	return restrictinfo;
 }
-#endif
 
 static Node *
 timebucket_annotate(Node *quals, CollectQualCtx *ctx)
@@ -726,7 +711,7 @@ timebucket_annotate(Node *quals, CollectQualCtx *ctx)
 	foreach (lc, castNode(List, quals))
 	{
 		Expr *qual = lfirst(lc);
-		Relids relids = pull_varnos((Node *) qual);
+		Relids relids = pull_varnos_compat(ctx->root, (Node *) qual);
 		int num_rels = bms_num_members(relids);
 
 		/* stop processing if not for current rel */
@@ -760,7 +745,8 @@ timebucket_annotate(Node *quals, CollectQualCtx *ctx)
 			}
 		}
 
-		ctx->restrictions = lappend(ctx->restrictions, make_simple_restrictinfo(qual));
+		ctx->restrictions =
+			lappend(ctx->restrictions, make_simple_restrictinfo_compat(ctx->root, qual));
 	}
 	return (Node *) list_concat((List *) quals, additional_quals);
 }
@@ -790,7 +776,7 @@ collect_join_quals(Node *quals, CollectQualCtx *ctx, bool can_propagate)
 	foreach (lc, (List *) quals)
 	{
 		Expr *qual = lfirst(lc);
-		Relids relids = pull_varnos((Node *) qual);
+		Relids relids = pull_varnos_compat(ctx->root, (Node *) qual);
 		int num_rels = bms_num_members(relids);
 
 		/*
@@ -902,16 +888,26 @@ should_order_append(PlannerInfo *root, RelOptInfo *rel, Hypertable *ht, List *jo
 	return ts_ordered_append_should_optimize(root, rel, ht, join_conditions, order_attno, reverse);
 }
 
-/*  get chunk oids specified by explicit chunk exclusion function */
+/*
+ *  get chunk oids specified by explicit chunk exclusion function
+ *
+ *  Similar to the regular get_chunk_oids, we also populate the fdw_private
+ *  structure appropriately if ordering info is present.
+ */
 static List *
-get_explicit_chunk_oids(CollectQualCtx *ctx, Hypertable *ht)
+get_explicit_chunk_oids(CollectQualCtx *ctx, PlannerInfo *root, RelOptInfo *rel, Hypertable *ht)
 {
 	List *chunk_oids = NIL;
 	Const *chunks_arg;
 	ArrayIterator chunk_id_iterator;
+	ArrayType *chunk_id_arr;
 	Datum elem = (Datum) NULL;
 	bool isnull;
 	Expr *expr;
+	bool reverse;
+	int order_attno;
+	Chunk **chunks = NULL;
+	unsigned int num_chunks = 0;
 
 	Assert(ctx->chunk_exclusion_func->args->length == 2);
 	expr = lsecond(ctx->chunk_exclusion_func->args);
@@ -925,8 +921,16 @@ get_explicit_chunk_oids(CollectQualCtx *ctx, Hypertable *ht)
 	/* function marked as STRICT so argument can't be NULL */
 	Assert(!chunks_arg->constisnull);
 
-	chunk_id_iterator = array_create_iterator(DatumGetArrayTypeP(chunks_arg->constvalue), 0, NULL);
+	chunk_id_arr = DatumGetArrayTypeP(chunks_arg->constvalue);
+	if (ARR_NDIM(chunk_id_arr) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid number of array dimensions for chunks_in")));
+	/* allocate an array of "Chunk *" and set it up below */
+	chunks = (Chunk **) palloc0(sizeof(Chunk *) *
+								ArrayGetNItems(ARR_NDIM(chunk_id_arr), ARR_DIMS(chunk_id_arr)));
 
+	chunk_id_iterator = array_create_iterator(chunk_id_arr, 0, NULL);
 	while (array_iterate(chunk_id_iterator, &elem, &isnull))
 	{
 		if (!isnull)
@@ -945,11 +949,46 @@ get_explicit_chunk_oids(CollectQualCtx *ctx, Hypertable *ht)
 								NameStr(ht->fd.table_name))));
 
 			chunk_oids = lappend_int(chunk_oids, chunk->table_id);
+
+			chunks[num_chunks++] = chunk;
 		}
 		else
 			elog(ERROR, "chunk id can't be NULL");
 	}
 	array_free_iterator(chunk_id_iterator);
+
+	/*
+	 * If fdw_private has not been setup by caller there is no point checking
+	 * for ordered append as we can't pass the required metadata in fdw_private
+	 * to signal that this is safe to transform in ordered append plan in
+	 * set_rel_pathlist.
+	 */
+	if (rel->fdw_private != NULL &&
+		should_order_append(root, rel, ht, ctx->join_conditions, &order_attno, &reverse))
+	{
+		TimescaleDBPrivate *priv = ts_get_private_reloptinfo(rel);
+		List **nested_oids = NULL;
+
+		priv->appends_ordered = true;
+		priv->order_attno = order_attno;
+
+		/*
+		 * for space partitioning we need extra information about the
+		 * time slices of the chunks
+		 */
+		if (ht->space->num_dimensions > 1)
+			nested_oids = &priv->nested_oids;
+
+		/* we don't need "hri" here since we already have the chunks */
+		return ts_hypertable_restrict_info_get_chunk_oids_ordered(NULL,
+																  ht,
+																  chunks,
+																  num_chunks,
+																  AccessShareLock,
+																  nested_oids,
+																  reverse);
+	}
+
 	return chunk_oids;
 }
 
@@ -1004,6 +1043,8 @@ get_chunk_oids(CollectQualCtx *ctx, PlannerInfo *root, RelOptInfo *rel, Hypertab
 
 			return ts_hypertable_restrict_info_get_chunk_oids_ordered(hri,
 																	  ht,
+																	  NULL,
+																	  0,
 																	  AccessShareLock,
 																	  nested_oids,
 																	  reverse);
@@ -1011,7 +1052,7 @@ get_chunk_oids(CollectQualCtx *ctx, PlannerInfo *root, RelOptInfo *rel, Hypertab
 		return find_children_oids(hri, ht, AccessShareLock);
 	}
 	else
-		return get_explicit_chunk_oids(ctx, ht);
+		return get_explicit_chunk_oids(ctx, root, rel, ht);
 }
 
 /*
@@ -1183,9 +1224,7 @@ ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, RelOptInfo *
 		.join_level = 0,
 	};
 	Index first_chunk_index = 0;
-#if PG12_GE
 	Index i;
-#endif
 
 	/* double check our permissions are valid */
 	Assert(rti != parse->resultRelation);
@@ -1195,11 +1234,6 @@ ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, RelOptInfo *
 	if (oldrc && RowMarkRequiresRowShareLock(oldrc->markType))
 		elog(ERROR, "unexpected permissions requested");
 
-		/* mark the parent as an append relation */
-#if PG12_LT
-	rte->inh = true;
-#endif
-
 	init_chunk_exclusion_func();
 
 	/* Walk the tree and find restrictions or chunk exclusion functions */
@@ -1207,9 +1241,7 @@ ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, RelOptInfo *
 	/* check join_level bookkeeping is balanced */
 	Assert(ctx.join_level == 0);
 
-#if PG12_GE
 	rel->baserestrictinfo = remove_exclusion_fns(rel->baserestrictinfo);
-#endif
 
 	if (ctx.propagate_conditions != NIL)
 		propagate_join_quals(root, rel, &ctx);
@@ -1227,25 +1259,7 @@ ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, RelOptInfo *
 	 * children to them. We include potential data node rels we might need to
 	 * create in case of a distributed hypertable.
 	 */
-#if PG12_GE
 	expand_planner_arrays(root, list_length(inh_oids) + list_length(ht->data_nodes));
-#else
-	Size old_rel_array_len = root->simple_rel_array_size;
-	root->simple_rel_array_size += (list_length(inh_oids) + list_length(ht->data_nodes));
-	root->simple_rel_array =
-		repalloc(root->simple_rel_array, root->simple_rel_array_size * sizeof(RelOptInfo *));
-	/* postgres expects these arrays to be 0'ed until intialized */
-	memset(root->simple_rel_array + old_rel_array_len,
-		   0,
-		   list_length(inh_oids) * sizeof(*root->simple_rel_array));
-
-	root->simple_rte_array =
-		repalloc(root->simple_rte_array, root->simple_rel_array_size * sizeof(RangeTblEntry *));
-	/* postgres expects these arrays to be 0'ed until intialized */
-	memset(root->simple_rte_array + old_rel_array_len,
-		   0,
-		   list_length(inh_oids) * sizeof(*root->simple_rte_array));
-#endif
 
 	/* Adding partition info will make PostgreSQL consider the inheritance
 	 * children as part of a partitioned relation. This will enable
@@ -1264,11 +1278,7 @@ ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, RelOptInfo *
 		RangeTblEntry *childrte;
 		Index child_rtindex;
 		AppendRelInfo *appinfo;
-#if PG11
-		LOCKMODE chunk_lock = NoLock;
-#else
 		LOCKMODE chunk_lock = rte->rellockmode;
-#endif
 
 		/* Open rel if needed */
 
@@ -1305,9 +1315,6 @@ ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, RelOptInfo *
 		if (first_chunk_index == 0)
 			first_chunk_index = child_rtindex;
 		root->simple_rte_array[child_rtindex] = childrte;
-#if PG12_LT
-		root->simple_rel_array[child_rtindex] = NULL;
-#endif
 
 		appinfo = makeNode(AppendRelInfo);
 		appinfo->parent_relid = rti;
@@ -1360,9 +1367,8 @@ ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, RelOptInfo *
 	}
 
 	root->append_rel_list = list_concat(root->append_rel_list, appinfos);
-	setup_append_rel_array(root);
+	ts_setup_append_rel_array(root);
 
-#if PG12_GE
 	/* In pg12 postgres will not set up the child rels for use, due to the games
 	 * we're playing with inheritance, so we must do it ourselves.
 	 * build_simple_rel will look things up in the append_rel_array, so we can
@@ -1379,7 +1385,6 @@ ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, RelOptInfo *
 		if (rel->part_rels != NULL)
 			rel->part_rels[i] = child_rel;
 	}
-#endif
 }
 
 void
@@ -1466,19 +1471,19 @@ propagate_join_quals(PlannerInfo *root, RelOptInfo *rel, CollectQualCtx *ctx)
 
 			if (new_qual)
 			{
-				Relids relids = pull_varnos((Node *) propagated);
+				Relids relids = pull_varnos_compat(root, (Node *) propagated);
 				RestrictInfo *restrictinfo;
 
-				restrictinfo = make_restrictinfo((Expr *) propagated,
-												 true,
-												 false,
-												 false,
-												 ctx->root->qual_security_level,
-												 relids,
-												 NULL,
-												 NULL);
+				restrictinfo = make_restrictinfo_compat(root,
+														(Expr *) propagated,
+														true,
+														false,
+														false,
+														ctx->root->qual_security_level,
+														relids,
+														NULL,
+														NULL);
 				ctx->restrictions = lappend(ctx->restrictions, restrictinfo);
-#if PG12_GE
 				/*
 				 * since hypertable expansion happens later in PG12 the propagated
 				 * constraints will not be pushed down to the actual scans but stay
@@ -1496,11 +1501,6 @@ propagate_join_quals(PlannerInfo *root, RelOptInfo *rel, CollectQualCtx *ctx)
 					root->parse->jointree->quals =
 						(Node *) lappend((List *) root->parse->jointree->quals, propagated);
 				}
-#else
-				root->parse->jointree->quals =
-					(Node *) lappend((List *) root->parse->jointree->quals, propagated);
-
-#endif
 			}
 		}
 	}

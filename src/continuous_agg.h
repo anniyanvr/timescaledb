@@ -86,8 +86,11 @@ extern void ts_continuous_agg_rename_view(const char *old_schema, const char *na
 extern TSDLLEXPORT int32 ts_number_of_continuous_aggs(void);
 
 extern Oid ts_continuous_agg_get_user_view_oid(ContinuousAgg *agg);
-extern TSDLLEXPORT Dimension *
+extern TSDLLEXPORT const Dimension *
 ts_continuous_agg_find_integer_now_func_by_materialization_id(int32 mat_htid);
 extern ContinuousAgg *ts_continuous_agg_find_userview_name(const char *schema, const char *name);
+
+extern TSDLLEXPORT int64 ts_continuous_agg_bucket_width(const ContinuousAgg *agg);
+extern TSDLLEXPORT int64 ts_continuous_agg_max_bucket_width(const ContinuousAgg *agg);
 
 #endif /* TIMESCALEDB_CONTINUOUS_AGG_H */

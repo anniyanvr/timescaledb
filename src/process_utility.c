@@ -66,7 +66,7 @@
 #include "continuous_agg.h"
 #include "compression_with_clause.h"
 #include "partitioning.h"
-#include "debug_wait.h"
+#include "debug_point.h"
 
 #include "cross_module_fn.h"
 
@@ -105,6 +105,26 @@ prev_ProcessUtility(ProcessUtilityArgs *args)
 								args->dest,
 								args->completion_tag);
 	}
+}
+
+static ObjectType
+get_altertable_objecttype(AlterTableStmt *stmt)
+{
+#if PG14_GE
+	return stmt->objtype;
+#else
+	return stmt->relkind;
+#endif
+}
+
+static ObjectType
+get_createtableas_objecttype(CreateTableAsStmt *stmt)
+{
+#if PG14_GE
+	return stmt->objtype;
+#else
+	return stmt->relkind;
+#endif
 }
 
 static void
@@ -222,11 +242,6 @@ check_alter_table_allowed_on_ht_with_compression(Hypertable *ht, AlterTableStmt 
 				 * List things that we want to explicitly block for documentation purposes
 				 * But also block everything else as well.
 				 */
-#if PG12_LT
-			case AT_AddOids:
-			case AT_DropOids:
-			case AT_AddOidsRecurse:
-#endif
 			case AT_EnableRowSecurity:
 			case AT_DisableRowSecurity:
 			case AT_ForceRowSecurity:
@@ -268,7 +283,7 @@ relation_not_only(RangeVar *rv)
 }
 
 static void
-add_hypertable_to_process_args(ProcessUtilityArgs *args, Hypertable *ht)
+add_hypertable_to_process_args(ProcessUtilityArgs *args, const Hypertable *ht)
 {
 	args->hypertable_list = lappend_oid(args->hypertable_list, ht->main_table_relid);
 }
@@ -331,6 +346,42 @@ process_drop_foreign_server_start(DropStmt *stmt)
 					 errhint("Use delete_data_node() to remove data nodes from a "
 							 "distributed database.")));
 	}
+}
+
+static void
+process_drop_trigger_start(ProcessUtilityArgs *args, DropStmt *stmt)
+{
+	Cache *hcache = ts_hypertable_cache_pin();
+	ListCell *lc;
+
+	foreach (lc, stmt->objects)
+	{
+		Node *object = lfirst(lc);
+		Relation rel = NULL;
+		ObjectAddress objaddr;
+
+		/* Get the relation of the trigger */
+		objaddr =
+			get_object_address(stmt->removeType, object, &rel, AccessShareLock, stmt->missing_ok);
+
+		if (OidIsValid(objaddr.objectId))
+		{
+			const Hypertable *ht;
+
+			Assert(NULL != rel);
+			Assert(objaddr.classId == TriggerRelationId);
+			ht =
+				ts_hypertable_cache_get_entry(hcache, RelationGetRelid(rel), CACHE_FLAG_MISSING_OK);
+
+			if (NULL != ht)
+				add_hypertable_to_process_args(args, ht);
+
+			/* Lock from get_object_address must be held until transaction end */
+			table_close(rel, NoLock);
+		}
+	}
+
+	ts_cache_release(hcache);
 }
 
 static DDLResult
@@ -696,7 +747,6 @@ ts_get_all_vacuum_rels(bool is_vacuumcmd)
 		Chunk *chunk;
 		Oid relid;
 
-#if PG12_GE
 		relid = classform->oid;
 
 		/* check permissions of relation */
@@ -704,9 +754,6 @@ ts_get_all_vacuum_rels(bool is_vacuumcmd)
 									  classform,
 									  is_vacuumcmd ? VACOPT_VACUUM : VACOPT_ANALYZE))
 			continue;
-#else
-		relid = HeapTupleGetOid(tuple);
-#endif
 
 		/*
 		 * We include partitioned tables here; depending on which operation is
@@ -761,11 +808,7 @@ process_vacuum(ProcessUtilityArgs *args)
 	List *vacuum_rels = NIL;
 	bool is_vacuumcmd;
 
-#if PG12_GE
 	is_vacuumcmd = stmt->is_vacuumcmd;
-#else
-	is_vacuumcmd = stmt->options & VACOPT_VACUUM;
-#endif
 
 	if (stmt->rels == NIL)
 		vacuum_rels = ts_get_all_vacuum_rels(is_vacuumcmd);
@@ -825,12 +868,7 @@ process_vacuum(ProcessUtilityArgs *args)
 		PreventCommandDuringRecovery(is_vacuumcmd ? "VACUUM" : "ANALYZE");
 
 		/* ACL permission checks inside vacuum_rel and analyze_rel called by this ExecVacuum */
-		ExecVacuum(
-#if PG12_GE
-			args->parse_state,
-#endif
-			stmt,
-			is_toplevel);
+		ExecVacuum(args->parse_state, stmt, is_toplevel);
 		foreach (lc, ctx.chunk_pairs)
 		{
 			ChunkPair *cp = (ChunkPair *) lfirst(lc);
@@ -1283,14 +1321,33 @@ process_grant_and_revoke(ProcessUtilityArgs *args)
 					ContinuousAgg *const cagg = ts_continuous_agg_find_by_rv(relation);
 					if (cagg)
 					{
-						Hypertable *ht = ts_hypertable_get_by_id(cagg->data.mat_hypertable_id);
-						process_grant_add_by_name(stmt, &ht->fd.schema_name, &ht->fd.table_name);
+						Hypertable *mat_hypertable =
+							ts_hypertable_get_by_id(cagg->data.mat_hypertable_id);
+						process_grant_add_by_name(stmt,
+												  &mat_hypertable->fd.schema_name,
+												  &mat_hypertable->fd.table_name);
 						process_grant_add_by_name(stmt,
 												  &cagg->data.direct_view_schema,
 												  &cagg->data.direct_view_name);
 						process_grant_add_by_name(stmt,
 												  &cagg->data.partial_view_schema,
 												  &cagg->data.partial_view_name);
+					}
+
+					/*
+					 * If this is a hypertable and it has a compressed
+					 * hypertable associated with it, add it to the list of
+					 * hypertables to process.
+					 */
+					Hypertable *hypertable = ts_hypertable_cache_get_entry_rv(hcache, relation);
+					if (hypertable && TS_HYPERTABLE_HAS_COMPRESSION_TABLE(hypertable))
+					{
+						Hypertable *compressed_hypertable =
+							ts_hypertable_get_by_id(hypertable->fd.compressed_hypertable_id);
+						Assert(compressed_hypertable);
+						process_grant_add_by_name(stmt,
+												  &compressed_hypertable->fd.schema_name,
+												  &compressed_hypertable->fd.table_name);
 					}
 				}
 
@@ -1302,7 +1359,6 @@ process_grant_and_revoke(ProcessUtilityArgs *args)
 
 					if (ht)
 					{
-						/* Here we know that there is at least one hypertable */
 						add_hypertable_to_process_args(args, ht);
 						foreach_chunk(ht, add_chunk_oid, args);
 					}
@@ -1410,6 +1466,9 @@ process_drop_start(ProcessUtilityArgs *args)
 		case OBJECT_FOREIGN_SERVER:
 			process_drop_foreign_server_start(stmt);
 			break;
+		case OBJECT_TRIGGER:
+			process_drop_trigger_start(args, stmt);
+			break;
 		default:
 			break;
 	}
@@ -1431,9 +1490,12 @@ reindex_chunk(Hypertable *ht, Oid chunk_relid, void *arg)
 			stmt->relation->schemaname = NameStr(chunk->fd.schema_name);
 			ReindexTable(stmt->relation,
 						 stmt->options
-#if PG12_GE
+#if PG14_LT
 						 ,
 						 stmt->concurrent /* should test for deadlocks */
+#elif PG14_GE
+						 ,
+						 false /* isTopLevel */
 #endif
 			);
 			break;
@@ -1478,13 +1540,29 @@ process_reindex(ProcessUtilityArgs *args)
 			{
 				PreventCommandDuringRecovery("REINDEX");
 				ts_hypertable_permissions_check_by_id(ht->fd.id);
+#if PG14_LT
+				if (stmt->concurrent)
+#else
+				if (stmt->options & REINDEXOPT_CONCURRENTLY)
+#endif
+					ereport(ERROR,
+							(errmsg("concurrent index creation on hypertables is not supported")));
 
-				if (foreach_chunk(ht, reindex_chunk, args) >= 0)
+				/* Do not process remote chunks in case of distributed hypertable */
+				if (hypertable_is_distributed(ht))
+				{
 					result = DDL_DONE;
+				}
+				else
+				{
+					if (foreach_chunk(ht, reindex_chunk, args) >= 0)
+						result = DDL_DONE;
+				}
 
 				add_hypertable_to_process_args(args, ht);
 			}
 			break;
+
 		case REINDEX_OBJECT_INDEX:
 			ht = ts_hypertable_cache_get_entry(hcache,
 											   IndexGetRelation(relid, true),
@@ -1570,7 +1648,7 @@ process_rename_column(ProcessUtilityArgs *args, Cache *hcache, Oid relid, Rename
 
 	add_hypertable_to_process_args(args, ht);
 
-	dim = ts_hyperspace_get_dimension_by_name(ht->space, DIMENSION_TYPE_ANY, stmt->subname);
+	dim = ts_hyperspace_get_mutable_dimension_by_name(ht->space, DIMENSION_TYPE_ANY, stmt->subname);
 
 	if (dim)
 		ts_dimension_set_name(dim, stmt->newname);
@@ -1684,7 +1762,18 @@ validate_hypertable_constraint(Hypertable *ht, Oid chunk_relid, void *arg)
 }
 
 static void
-process_rename_constraint(ProcessUtilityArgs *args, Cache *hcache, Oid relid, RenameStmt *stmt)
+rename_hypertable_trigger(Hypertable *ht, Oid chunk_relid, void *arg)
+{
+	RenameStmt *stmt = copyObject(castNode(RenameStmt, arg));
+	Chunk *chunk = ts_chunk_get_by_relid(chunk_relid, true);
+
+	stmt->relation = makeRangeVar(NameStr(chunk->fd.schema_name), NameStr(chunk->fd.table_name), 0);
+	renametrig(stmt);
+}
+
+static void
+process_rename_constraint_or_trigger(ProcessUtilityArgs *args, Cache *hcache, Oid relid,
+									 RenameStmt *stmt)
 {
 	Hypertable *ht;
 
@@ -1694,9 +1783,13 @@ process_rename_constraint(ProcessUtilityArgs *args, Cache *hcache, Oid relid, Re
 	{
 		relation_not_only(stmt->relation);
 		add_hypertable_to_process_args(args, ht);
-		foreach_chunk(ht, rename_hypertable_constraint, stmt);
+
+		if (stmt->renameType == OBJECT_TABCONSTRAINT)
+			foreach_chunk(ht, rename_hypertable_constraint, stmt);
+		else if (stmt->renameType == OBJECT_TRIGGER && !hypertable_is_distributed(ht))
+			foreach_chunk(ht, rename_hypertable_trigger, stmt);
 	}
-	else
+	else if (stmt->renameType == OBJECT_TABCONSTRAINT)
 	{
 		Chunk *chunk = ts_chunk_get_by_relid(relid, false);
 
@@ -1752,7 +1845,8 @@ process_rename(ProcessUtilityArgs *args)
 			process_rename_index(args, hcache, relid, stmt);
 			break;
 		case OBJECT_TABCONSTRAINT:
-			process_rename_constraint(args, hcache, relid, stmt);
+		case OBJECT_TRIGGER:
+			process_rename_constraint_or_trigger(args, hcache, relid, stmt);
 			break;
 		case OBJECT_MATVIEW:
 		case OBJECT_VIEW:
@@ -1988,7 +2082,6 @@ typedef struct HypertableIndexOptions
 	 */
 	bool multitransaction;
 	int n_ht_atts;
-	bool ht_hasoid;
 
 	/* Concurrency testing options. */
 #ifdef DEBUG
@@ -2038,13 +2131,8 @@ process_index_chunk(Hypertable *ht, Oid chunk_relid, void *arg)
 	hypertable_index_rel = index_open(info->obj.objectId, AccessShareLock);
 	indexinfo = BuildIndexInfo(hypertable_index_rel);
 
-	if (chunk_index_columns_changed(info->extended_options.n_ht_atts,
-									info->extended_options.ht_hasoid,
-									RelationGetDescr(chunk_rel)))
-		ts_adjust_indexinfo_attnos(indexinfo,
-								   info->main_table_relid,
-								   hypertable_index_rel,
-								   chunk_rel);
+	if (chunk_index_columns_changed(info->extended_options.n_ht_atts, RelationGetDescr(chunk_rel)))
+		ts_adjust_indexinfo_attnos(indexinfo, info->main_table_relid, chunk_rel);
 
 	ts_chunk_index_create_from_adjusted_index_info(ht->fd.id,
 												   hypertable_index_rel,
@@ -2130,13 +2218,8 @@ process_index_chunk_multitransaction(int32 hypertable_id, Oid chunk_relid, void 
 	 * through the usual DefineIndex mechanism.
 	 */
 	indexinfo = BuildIndexInfo(hypertable_index_rel);
-	if (chunk_index_columns_changed(info->extended_options.n_ht_atts,
-									info->extended_options.ht_hasoid,
-									RelationGetDescr(chunk_rel)))
-		ts_adjust_indexinfo_attnos(indexinfo,
-								   info->main_table_relid,
-								   hypertable_index_rel,
-								   chunk_rel);
+	if (chunk_index_columns_changed(info->extended_options.n_ht_atts, RelationGetDescr(chunk_rel)))
+		ts_adjust_indexinfo_attnos(indexinfo, info->main_table_relid, chunk_rel);
 
 	ts_chunk_index_create_from_adjusted_index_info(hypertable_id,
 												   hypertable_index_rel,
@@ -2318,7 +2401,6 @@ process_index_start(ProcessUtilityArgs *args)
 	main_table_index_lock_relid = main_table_index_relation->rd_lockInfo.lockRelId;
 
 	info.extended_options.n_ht_atts = main_table_desc->natts;
-	info.extended_options.ht_hasoid = TUPLE_DESC_HAS_OIDS(main_table_desc);
 	info.main_table_relid = ht->main_table_relid;
 
 	index_close(main_table_index_relation, NoLock);
@@ -2565,11 +2647,10 @@ process_cluster_start(ProcessUtilityArgs *args)
 			 */
 			cluster_rel(cim->chunkoid,
 						cim->indexoid,
-#if PG12_LT
-						true,
-						stmt->verbose
-#else
 						stmt->options
+#if PG14_GE
+						,
+						args->context == PROCESS_UTILITY_TOPLEVEL
 #endif
 			);
 			PopActiveSnapshot();
@@ -2677,7 +2758,8 @@ process_alter_column_type_end(Hypertable *ht, AlterTableCmd *cmd)
 {
 	ColumnDef *coldef = (ColumnDef *) cmd->def;
 	Oid new_type = TypenameGetTypid(typename_get_unqual_name(coldef->typeName));
-	Dimension *dim = ts_hyperspace_get_dimension_by_name(ht->space, DIMENSION_TYPE_ANY, cmd->name);
+	Dimension *dim =
+		ts_hyperspace_get_mutable_dimension_by_name(ht->space, DIMENSION_TYPE_ANY, cmd->name);
 
 	if (NULL == dim)
 		return;
@@ -2696,7 +2778,7 @@ process_altertable_clusteron_end(Hypertable *ht, AlterTableCmd *cmd)
 
 	/* If this is part of changing the type of a column that is used in a clustered index
 	 * the above lookup might fail. But in this case we don't need to mark the index clustered
-	 * as postgres takes care of that already (except PG11 < 11.8 and PG12 < 12.3) */
+	 * as postgres takes care of that already (except PG12 < 12.3) */
 	if (!OidIsValid(index_relid))
 		return;
 
@@ -3125,7 +3207,7 @@ static DDLResult
 process_altertable_start(ProcessUtilityArgs *args)
 {
 	AlterTableStmt *stmt = (AlterTableStmt *) args->parsetree;
-	switch (stmt->relkind)
+	switch (get_altertable_objecttype(stmt))
 	{
 		case OBJECT_TABLE:
 			return process_altertable_start_table(args);
@@ -3245,9 +3327,6 @@ process_altertable_end_subcmd(Hypertable *ht, Node *parsetree, ObjectAddress *ob
 		case AT_SetRelOptions:
 		case AT_ResetRelOptions:
 		case AT_ReplaceRelOptions:
-#if PG12_LT
-		case AT_AddOids:
-#endif
 		case AT_DropOids:
 		case AT_SetOptions:
 		case AT_ResetOptions:
@@ -3273,9 +3352,7 @@ process_altertable_end_subcmd(Hypertable *ht, Node *parsetree, ObjectAddress *ob
 		case AT_CookedColumnDefault:
 #endif
 		case AT_SetNotNull:
-#if PG12_GE
 		case AT_CheckNotNull:
-#endif
 		case AT_DropNotNull:
 		case AT_AddOf:
 		case AT_DropOf:
@@ -3292,9 +3369,6 @@ process_altertable_end_subcmd(Hypertable *ht, Node *parsetree, ObjectAddress *ob
 			break;
 		case AT_ReAddConstraint:
 		case AT_ReAddIndex:
-#if PG12_LT
-		case AT_AddOidsRecurse:
-#endif
 
 			/*
 			 * all of the above are internal commands that are hit in tests
@@ -3408,7 +3482,7 @@ process_altertable_end(Node *parsetree, CollectedCommand *cmd)
 {
 	AlterTableStmt *stmt = (AlterTableStmt *) parsetree;
 
-	switch (stmt->relkind)
+	switch (get_altertable_objecttype(stmt))
 	{
 		case OBJECT_TABLE:
 			process_altertable_end_table(parsetree, cmd);
@@ -3429,9 +3503,6 @@ process_create_trigger_start(ProcessUtilityArgs *args)
 	Hypertable *ht;
 	ObjectAddress PG_USED_FOR_ASSERTS_ONLY address;
 
-	if (!stmt->row)
-		return DDL_CONTINUE;
-
 	hcache = ts_hypertable_cache_pin();
 	ht = ts_hypertable_cache_get_entry_rv(hcache, stmt->relation);
 	if (ht == NULL)
@@ -3440,7 +3511,22 @@ process_create_trigger_start(ProcessUtilityArgs *args)
 		return DDL_CONTINUE;
 	}
 
+	if (stmt->transitionRels)
+	{
+		ts_cache_release(hcache);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("trigger with transition tables not supported on hypertables")));
+	}
+
 	add_hypertable_to_process_args(args, ht);
+
+	if (!stmt->row)
+	{
+		ts_cache_release(hcache);
+		return DDL_CONTINUE;
+	}
+
 	address = ts_hypertable_create_trigger(ht, stmt, args->query_string);
 	Assert(OidIsValid(address.objectId));
 
@@ -3537,7 +3623,7 @@ process_create_table_as(ProcessUtilityArgs *args)
 	bool is_cagg = false;
 	List *pg_options = NIL, *cagg_options = NIL;
 
-	if (stmt->relkind == OBJECT_MATVIEW)
+	if (get_createtableas_objecttype(stmt) == OBJECT_MATVIEW)
 	{
 		/* Check for creation of continuous aggregate */
 		ts_with_clause_filter(stmt->into->options, &cagg_options, &pg_options);

@@ -7,13 +7,13 @@
 setup
 {
 	CREATE OR REPLACE FUNCTION debug_waitpoint_enable(TEXT) RETURNS VOID LANGUAGE C VOLATILE STRICT
-	AS '@TS_MODULE_PATHNAME@', 'ts_debug_waitpoint_enable';
+	AS '@TS_MODULE_PATHNAME@', 'ts_debug_point_enable';
 
 	CREATE OR REPLACE FUNCTION debug_waitpoint_release(TEXT) RETURNS VOID LANGUAGE C VOLATILE STRICT
-	AS '@TS_MODULE_PATHNAME@', 'ts_debug_waitpoint_release';
+	AS '@TS_MODULE_PATHNAME@', 'ts_debug_point_release';
 
 	CREATE OR REPLACE FUNCTION debug_waitpoint_id(TEXT) RETURNS BIGINT LANGUAGE C VOLATILE STRICT
-	AS '@TS_MODULE_PATHNAME@', 'ts_debug_waitpoint_id';
+	AS '@TS_MODULE_PATHNAME@', 'ts_debug_point_id';
 
 	CREATE OR REPLACE FUNCTION waitpoint_locks(tag TEXT) RETURNS bigint AS
 	$$
@@ -57,6 +57,7 @@ setup
 {
 	SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
 	SET application_name = 's2';
+	SET client_min_messages TO warning;
 }
 step "s2_create_dist_rp" { SELECT restore_point > pg_lsn('0/0') as valid_lsn FROM create_distributed_restore_point('s2_test'); }
 step "s2_insert"         { INSERT INTO disttable VALUES ('2019-08-02 10:45', 0, 0.0); }

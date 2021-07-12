@@ -79,6 +79,12 @@ get_trigger_cmd(Oid oid)
 }
 
 static const char *
+get_function_cmd(Oid oid)
+{
+	return TextDatumGetCString(pg_get_functiondef(build_fcinfo_data(oid)));
+}
+
+static const char *
 get_rule_cmd(Oid oid)
 {
 	return TextDatumGetCString(pg_get_ruledef(build_fcinfo_data(oid)));
@@ -116,6 +122,12 @@ static List *
 get_trigger_cmds(List *trigger_oids)
 {
 	return get_cmds(trigger_oids, get_trigger_cmd);
+}
+
+static List *
+get_function_cmds(List *function_oids)
+{
+	return get_cmds(function_oids, get_function_cmd);
 }
 
 static List *
@@ -195,7 +207,12 @@ deparse_columns(StringInfo stmt, Relation rel)
 																CStringGetTextDatum(attr_def.adbin),
 																ObjectIdGetDatum(rel->rd_id)));
 
-					appendStringInfo(stmt, " DEFAULT %s", attr_default);
+					if (attr->attgenerated == ATTRIBUTE_GENERATED_STORED)
+						appendStringInfo(stmt, " GENERATED ALWAYS AS %s STORED", attr_default);
+					else
+					{
+						appendStringInfo(stmt, " DEFAULT %s", attr_default);
+					}
 					break;
 				}
 			}
@@ -224,11 +241,7 @@ add_constraint(HeapTuple constraint_tuple, void *ctx)
 
 	if (OidIsValid(constraint->conindid))
 		*cc->constraint_indexes = lappend_oid(*cc->constraint_indexes, constraint->conindid);
-#if PG12_GE
 	constroid = constraint->oid;
-#else
-	constroid = HeapTupleGetOid(constraint_tuple);
-#endif
 	cc->constraints = lappend_oid(cc->constraints, constroid);
 	return CONSTR_PROCESSED;
 }
@@ -287,6 +300,27 @@ get_trigger_oids(Relation rel)
 }
 
 static List *
+get_trigger_function_oids(Relation rel)
+{
+	List *functions = NIL;
+
+	if (rel->trigdesc != NULL)
+	{
+		int i;
+
+		for (i = 0; i < rel->trigdesc->numtriggers; i++)
+		{
+			const Trigger trigger = rel->trigdesc->triggers[i];
+
+			if (!trigger.tgisinternal && strcmp(trigger.tgname, INSERT_BLOCKER_NAME) != 0)
+				functions = lappend_oid(functions, trigger.tgfoid);
+		}
+	}
+
+	return functions;
+}
+
+static List *
 get_rule_oids(Relation rel)
 {
 	List *rules = NIL;
@@ -331,7 +365,7 @@ deparse_create_table_info(Oid relid)
 	Relation rel = table_open(relid, AccessShareLock);
 
 	if (rel == NULL)
-		ereport(ERROR, (errmsg("relation with id %d not found", relid)));
+		ereport(ERROR, (errmsg("relation with id %u not found", relid)));
 
 	validate_relation(rel);
 
@@ -339,6 +373,7 @@ deparse_create_table_info(Oid relid)
 	table_info->constraints = get_constraint_oids(relid, &exclude_indexes);
 	table_info->indexes = get_index_oids(rel, exclude_indexes);
 	table_info->triggers = get_trigger_oids(rel);
+	table_info->functions = get_trigger_function_oids(rel);
 	table_info->rules = get_rule_oids(rel);
 	table_close(rel, AccessShareLock);
 	return table_info;
@@ -395,9 +430,7 @@ deparse_get_tabledef(TableInfo *table_info)
 	deparse_columns(create_table, rel);
 
 	appendStringInfoChar(create_table, ')');
-#if PG12_GE
 	appendStringInfo(create_table, " USING \"%s\" ", get_am_name(rel->rd_rel->relam));
-#endif
 	deparse_get_tabledef_with(table_info, create_table);
 
 	appendStringInfoChar(create_table, ';');
@@ -406,6 +439,7 @@ deparse_get_tabledef(TableInfo *table_info)
 	table_def->constraint_cmds = get_constraint_cmds(table_info->constraints);
 	table_def->index_cmds = get_index_cmds(table_info->indexes);
 	table_def->trigger_cmds = get_trigger_cmds(table_info->triggers);
+	table_def->function_cmds = get_function_cmds(table_info->functions);
 	table_def->rule_cmds = get_rule_cmds(table_info->rules);
 
 	table_close(rel, AccessShareLock);
@@ -539,6 +573,7 @@ deparse_get_tabledef_commands_from_tabledef(TableDef *table_def)
 	cmds = lappend(cmds, (char *) table_def->create_cmd);
 	cmds = list_concat(cmds, table_def->constraint_cmds);
 	cmds = list_concat(cmds, table_def->index_cmds);
+	cmds = list_concat(cmds, table_def->function_cmds);
 	cmds = list_concat(cmds, table_def->trigger_cmds);
 	cmds = list_concat(cmds, table_def->rule_cmds);
 	return cmds;

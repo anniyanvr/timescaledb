@@ -124,12 +124,12 @@ ts_bgw_start_worker(const char *function, const char *name, const char *extra)
 	};
 	BackgroundWorkerHandle *handle = NULL;
 
-	StrNCpy(worker.bgw_name, name, BGW_MAXLEN);
-	StrNCpy(worker.bgw_library_name, ts_extension_get_so_name(), BGW_MAXLEN);
-	StrNCpy(worker.bgw_function_name, function, BGW_MAXLEN);
+	strlcpy(worker.bgw_name, name, BGW_MAXLEN);
+	strlcpy(worker.bgw_library_name, ts_extension_get_so_name(), BGW_MAXLEN);
+	strlcpy(worker.bgw_function_name, function, BGW_MAXLEN);
 
 	Assert(strlen(extra) < BGW_EXTRALEN);
-	StrNCpy(worker.bgw_extra, extra, BGW_EXTRALEN);
+	strlcpy(worker.bgw_extra, extra, BGW_EXTRALEN);
 
 	/* handle needs to be allocated in long-lived memory context */
 	MemoryContextSwitchTo(scheduler_mctx);
@@ -747,7 +747,7 @@ ts_bgw_scheduler_process(int32 run_for_interval_ms,
 	if (run_for_interval_ms > 0)
 		quit_time = TimestampTzPlusMilliseconds(start, run_for_interval_ms);
 
-	ereport(DEBUG1, (errmsg("database scheduler starting for database %d", MyDatabaseId)));
+	ereport(DEBUG1, (errmsg("database scheduler starting for database %u", MyDatabaseId)));
 
 	/*
 	 * on SIGTERM the process will usually die from the CHECK_FOR_INTERRUPTS

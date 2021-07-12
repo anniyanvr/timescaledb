@@ -4,29 +4,21 @@
  * LICENSE-APACHE for a copy of the license.
  */
 #include <postgres.h>
-#include <miscadmin.h>
-#include <parser/parse_oper.h>
-#include <catalog/namespace.h>
-#include <catalog/pg_type.h>
-#include <catalog/pg_proc.h>
-#include <access/htup.h>
 #include <access/heapam.h>
-#include <utils/hsearch.h>
-#include <utils/lsyscache.h>
-#include <utils/syscache.h>
-#include <utils/selfuncs.h>
-#include <utils/builtins.h>
-#include <utils/rel.h>
-
-#include "compat.h"
-#if PG12_LT
-#include <nodes/relation.h>
-#include <optimizer/cost.h>
-#include <optimizer/clauses.h>
-#else
+#include <access/htup.h>
+#include <catalog/namespace.h>
+#include <catalog/pg_proc.h>
+#include <catalog/pg_type.h>
+#include <miscadmin.h>
 #include <nodes/pathnodes.h>
 #include <optimizer/optimizer.h>
-#endif
+#include <parser/parse_oper.h>
+#include <utils/builtins.h>
+#include <utils/hsearch.h>
+#include <utils/lsyscache.h>
+#include <utils/rel.h>
+#include <utils/selfuncs.h>
+#include <utils/syscache.h>
 
 #include "utils.h"
 #include "cache.h"
@@ -184,7 +176,7 @@ typedef struct FuncEntry
 /* Information about functions that we put in the cache */
 static FuncInfo funcinfo[] = {
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket",
 		.nargs = 2,
@@ -193,7 +185,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket",
 		.nargs = 3,
@@ -202,7 +194,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket",
 		.nargs = 2,
@@ -211,7 +203,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket",
 		.nargs = 3,
@@ -220,7 +212,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket",
 		.nargs = 2,
@@ -229,7 +221,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket",
 		.nargs = 3,
@@ -238,7 +230,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket",
 		.nargs = 2,
@@ -247,7 +239,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket",
 		.nargs = 3,
@@ -256,7 +248,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket",
 		.nargs = 2,
@@ -265,7 +257,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket",
 		.nargs = 3,
@@ -274,7 +266,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket",
 		.nargs = 2,
@@ -283,7 +275,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket",
 		.nargs = 3,
@@ -291,9 +283,44 @@ static FuncInfo funcinfo[] = {
 		.group_estimate = time_bucket_group_estimate,
 		.sort_transform = time_bucket_sort_transform,
 	},
-
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE_EXPERIMENTAL,
+		.is_bucketing_func = true,
+		.funcname = "time_bucket_ng",
+		.nargs = 2,
+		.arg_types = { INTERVALOID, DATEOID },
+		.group_estimate = time_bucket_group_estimate,
+		.sort_transform = time_bucket_sort_transform,
+	},
+	{
+		.origin = ORIGIN_TIMESCALE_EXPERIMENTAL,
+		.is_bucketing_func = true,
+		.funcname = "time_bucket_ng",
+		.nargs = 3,
+		.arg_types = { INTERVALOID, DATEOID, DATEOID },
+		.group_estimate = time_bucket_group_estimate,
+		.sort_transform = time_bucket_sort_transform,
+	},
+	{
+		.origin = ORIGIN_TIMESCALE_EXPERIMENTAL,
+		.is_bucketing_func = true,
+		.funcname = "time_bucket_ng",
+		.nargs = 2,
+		.arg_types = { INTERVALOID, TIMESTAMPOID },
+		.group_estimate = time_bucket_group_estimate,
+		.sort_transform = time_bucket_sort_transform,
+	},
+	{
+		.origin = ORIGIN_TIMESCALE_EXPERIMENTAL,
+		.is_bucketing_func = true,
+		.funcname = "time_bucket_ng",
+		.nargs = 3,
+		.arg_types = { INTERVALOID, TIMESTAMPOID, TIMESTAMPOID },
+		.group_estimate = time_bucket_group_estimate,
+		.sort_transform = time_bucket_sort_transform,
+	},
+	{
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket_gapfill",
 		.nargs = 4,
@@ -302,7 +329,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_gapfill_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket_gapfill",
 		.nargs = 4,
@@ -311,7 +338,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_gapfill_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket_gapfill",
 		.nargs = 4,
@@ -320,7 +347,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_gapfill_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket_gapfill",
 		.nargs = 4,
@@ -329,7 +356,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_gapfill_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket_gapfill",
 		.nargs = 4,
@@ -338,7 +365,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = time_bucket_gapfill_sort_transform,
 	},
 	{
-		.is_timescaledb_func = true,
+		.origin = ORIGIN_TIMESCALE,
 		.is_bucketing_func = true,
 		.funcname = "time_bucket_gapfill",
 		.nargs = 4,
@@ -348,7 +375,7 @@ static FuncInfo funcinfo[] = {
 	},
 
 	{
-		.is_timescaledb_func = false,
+		.origin = ORIGIN_POSTGRES,
 		.is_bucketing_func = true,
 		.funcname = "date_trunc",
 		.nargs = 2,
@@ -357,7 +384,7 @@ static FuncInfo funcinfo[] = {
 		.sort_transform = date_trunc_sort_transform,
 	},
 	{
-		.is_timescaledb_func = false,
+		.origin = ORIGIN_POSTGRES,
 		.is_bucketing_func = true,
 		.funcname = "date_trunc",
 		.nargs = 2,
@@ -374,12 +401,8 @@ static HTAB *func_hash = NULL;
 static Oid
 proc_get_oid(HeapTuple tuple)
 {
-#if PG12_LT
-	return HeapTupleGetOid(tuple);
-#else
 	Form_pg_proc form = (Form_pg_proc) GETSTRUCT(tuple);
 	return form->oid;
-#endif
 }
 
 static void
@@ -390,7 +413,8 @@ initialize_func_info()
 		.entrysize = sizeof(FuncEntry),
 		.hcxt = CacheMemoryContext,
 	};
-	Oid extension_nsp = get_namespace_oid(ts_extension_schema_name(), false);
+	Oid extension_nsp = ts_extension_schema_oid();
+	Oid experimental_nsp = get_namespace_oid(ts_experimental_schema_name(), false);
 	Oid pg_nsp = get_namespace_oid("pg_catalog", false);
 	HeapTuple tuple;
 	Relation rel;
@@ -403,11 +427,20 @@ initialize_func_info()
 	for (i = 0; i < _MAX_CACHE_FUNCTIONS; i++)
 	{
 		FuncInfo *finfo = &funcinfo[i];
-		Oid namespaceoid = finfo->is_timescaledb_func ? extension_nsp : pg_nsp;
+		Oid namespaceoid = pg_nsp;
 		oidvector *paramtypes = buildoidvector(finfo->arg_types, finfo->nargs);
 		FuncEntry *fentry;
 		bool hash_found;
 		Oid funcid;
+
+		if (finfo->origin == ORIGIN_TIMESCALE)
+		{
+			namespaceoid = extension_nsp;
+		}
+		else if (finfo->origin == ORIGIN_TIMESCALE_EXPERIMENTAL)
+		{
+			namespaceoid = experimental_nsp;
+		}
 
 		tuple = SearchSysCache3(PROCNAMEARGSNSP,
 								PointerGetDatum(finfo->funcname),

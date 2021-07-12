@@ -417,7 +417,7 @@ ts_calculate_chunk_interval(PG_FUNCTION_ARGS)
 	int64 current_interval;
 	int32 hypertable_id;
 	Hypertable *ht;
-	Dimension *dim;
+	const Dimension *dim;
 	List *chunks = NIL;
 	ListCell *lc;
 	int num_intervals = 0;
@@ -439,13 +439,18 @@ ts_calculate_chunk_interval(PG_FUNCTION_ARGS)
 
 	ht = ts_hypertable_get_by_id(hypertable_id);
 
+	Assert(ht != NULL);
+
 	acl_result = pg_class_aclcheck(ht->main_table_relid, GetUserId(), ACL_SELECT);
 	if (acl_result != ACLCHECK_OK)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied for table %s", ht->fd.table_name.data)));
 
-	Assert(ht != NULL);
+	if (hypertable_is_distributed(ht))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("adaptive chunking not supported on distributed hypertables")));
 
 	dim = ts_hyperspace_get_dimension_by_id(ht->space, dimension_id);
 
@@ -462,7 +467,8 @@ ts_calculate_chunk_interval(PG_FUNCTION_ARGS)
 	foreach (lc, chunks)
 	{
 		Chunk *chunk = lfirst(lc);
-		DimensionSlice *slice = ts_hypercube_get_slice_by_dimension_id(chunk->cube, dimension_id);
+		const DimensionSlice *slice =
+			ts_hypercube_get_slice_by_dimension_id(chunk->cube, dimension_id);
 		int64 chunk_size, slice_interval;
 		Datum minmax[2];
 		AttrNumber attno =
@@ -743,7 +749,7 @@ ts_chunk_adaptive_set(PG_FUNCTION_ARGS)
 		.check_for_index = true,
 	};
 	Hypertable *ht;
-	Dimension *dim;
+	const Dimension *dim;
 	Cache *hcache;
 	HeapTuple tuple;
 	TupleDesc tupdesc;

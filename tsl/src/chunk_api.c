@@ -117,7 +117,7 @@ hypercube_to_jsonb_value(Hypercube *hc, Hyperspace *hs, JsonbParseState **ps)
  *  "device": [-9223372036854775808, 1073741823]}
  */
 static Hypercube *
-hypercube_from_jsonb(Jsonb *json, Hyperspace *hs, const char **parse_error)
+hypercube_from_jsonb(Jsonb *json, const Hyperspace *hs, const char **parse_error)
 {
 	JsonbIterator *it;
 	JsonbIteratorToken type;
@@ -146,8 +146,7 @@ hypercube_from_jsonb(Jsonb *json, Hyperspace *hs, const char **parse_error)
 	while ((type = JsonbIteratorNext(&it, &v, false)))
 	{
 		int i;
-		Dimension *dim;
-		DimensionSlice *slice;
+		const Dimension *dim;
 		int64 range[2];
 		const char *name;
 
@@ -211,8 +210,7 @@ hypercube_from_jsonb(Jsonb *json, Hyperspace *hs, const char **parse_error)
 			goto out_err;
 		}
 
-		slice = ts_dimension_slice_create(dim->fd.id, range[0], range[1]);
-		ts_hypercube_add_slice(hc, slice);
+		ts_hypercube_add_slice_from_range(hc, dim->fd.id, range[0], range[1]);
 	}
 
 out_err:
@@ -407,19 +405,26 @@ get_result_datums(Datum *values, bool *nulls, unsigned int numvals, AttInMetadat
 	}
 }
 
+static const char *
+chunk_api_dimension_slices_json(const Chunk *chunk, const Hypertable *ht)
+{
+	JsonbParseState *ps = NULL;
+	JsonbValue *jv = hypercube_to_jsonb_value(chunk->cube, ht->space, &ps);
+	Jsonb *hcjson = JsonbValueToJsonb(jv);
+
+	return JsonbToCString(NULL, &hcjson->root, ESTIMATE_JSON_STR_SIZE(ht->space->num_dimensions));
+}
+
 /*
  * Create a replica of a chunk on all its assigned data nodes.
  */
 void
-chunk_api_create_on_data_nodes(Chunk *chunk, Hypertable *ht)
+chunk_api_create_on_data_nodes(const Chunk *chunk, const Hypertable *ht)
 {
 	AsyncRequestSet *reqset = async_request_set_create();
-	JsonbParseState *ps = NULL;
-	JsonbValue *jv = hypercube_to_jsonb_value(chunk->cube, ht->space, &ps);
-	Jsonb *hcjson = JsonbValueToJsonb(jv);
 	const char *params[4] = {
 		quote_qualified_identifier(NameStr(ht->fd.schema_name), NameStr(ht->fd.table_name)),
-		JsonbToCString(NULL, &hcjson->root, ESTIMATE_JSON_STR_SIZE(ht->space->num_dimensions)),
+		chunk_api_dimension_slices_json(chunk, ht),
 		NameStr(chunk->fd.schema_name),
 		NameStr(chunk->fd.table_name),
 	};
@@ -478,8 +483,8 @@ chunk_api_create_on_data_nodes(Chunk *chunk, Hypertable *ht)
 			DatumGetCString(values[AttrNumberGetAttrOffset(Anum_create_chunk_schema_name)]);
 		table_name = DatumGetCString(values[AttrNumberGetAttrOffset(Anum_create_chunk_table_name)]);
 
-		if (namestrcmp(&chunk->fd.schema_name, schema_name) != 0 ||
-			namestrcmp(&chunk->fd.table_name, table_name) != 0)
+		if (namestrcmp((Name) &chunk->fd.schema_name, schema_name) != 0 ||
+			namestrcmp((Name) &chunk->fd.table_name, table_name) != 0)
 			elog(ERROR, "remote chunk has mismatching schema or table name");
 
 		cdn->fd.node_chunk_id =
@@ -507,6 +512,7 @@ chunk_get_single_stats_tuple(Chunk *chunk, TupleDesc tupdesc)
 	Form_pg_class pgcform;
 	Datum values[_Anum_chunk_relstats_max];
 	bool nulls[_Anum_chunk_relstats_max] = { false };
+	float reltuples = 0;
 
 	ctup = SearchSysCache1(RELOID, ObjectIdGetDatum(chunk->table_id));
 
@@ -523,8 +529,8 @@ chunk_get_single_stats_tuple(Chunk *chunk, TupleDesc tupdesc)
 		Int32GetDatum(chunk->fd.hypertable_id);
 	values[AttrNumberGetAttrOffset(Anum_chunk_relstats_num_pages)] =
 		Int32GetDatum(pgcform->relpages);
-	values[AttrNumberGetAttrOffset(Anum_chunk_relstats_num_tuples)] =
-		Float4GetDatum(pgcform->reltuples);
+	reltuples = Float4GetDatum(pgcform->reltuples);
+	values[AttrNumberGetAttrOffset(Anum_chunk_relstats_num_tuples)] = reltuples > 0 ? reltuples : 0;
 	values[AttrNumberGetAttrOffset(Anum_chunk_relstats_num_allvisible)] =
 		Int32GetDatum(pgcform->relallvisible);
 
@@ -635,16 +641,16 @@ convert_op_oid_to_strings(Oid op_id, Datum *result_strings)
 static Oid
 convert_strings_to_type_id(Datum *input_strings)
 {
-	Oid arg_namespace = GetSysCacheOid1Compat(NAMESPACENAME,
-											  Anum_pg_namespace_oid,
-											  input_strings[ENCODED_TYPE_NAMESPACE]);
+	Oid arg_namespace = GetSysCacheOid1(NAMESPACENAME,
+										Anum_pg_namespace_oid,
+										input_strings[ENCODED_TYPE_NAMESPACE]);
 	Oid result;
 
 	Assert(arg_namespace != InvalidOid);
-	result = GetSysCacheOid2Compat(TYPENAMENSP,
-								   Anum_pg_type_oid,
-								   input_strings[ENCODED_TYPE_NAME],
-								   ObjectIdGetDatum(arg_namespace));
+	result = GetSysCacheOid2(TYPENAMENSP,
+							 Anum_pg_type_oid,
+							 input_strings[ENCODED_TYPE_NAME],
+							 ObjectIdGetDatum(arg_namespace));
 	Assert(result != InvalidOid);
 	return result;
 }
@@ -652,20 +658,19 @@ convert_strings_to_type_id(Datum *input_strings)
 static Oid
 convert_strings_to_op_id(Datum *input_strings)
 {
-	Oid proc_namespace = GetSysCacheOid1Compat(NAMESPACENAME,
-											   Anum_pg_namespace_oid,
-											   input_strings[ENCODED_OP_NAMESPACE]);
+	Oid proc_namespace =
+		GetSysCacheOid1(NAMESPACENAME, Anum_pg_namespace_oid, input_strings[ENCODED_OP_NAMESPACE]);
 	Oid larg = convert_strings_to_type_id(LargSubarrayForOpArray(input_strings));
 	Oid rarg = convert_strings_to_type_id(RargSubarrayForOpArray(input_strings));
 	Oid result;
 
 	Assert(proc_namespace != InvalidOid);
-	result = GetSysCacheOid4Compat(OPERNAMENSP,
-								   Anum_pg_operator_oid,
-								   input_strings[ENCODED_OP_NAME],
-								   ObjectIdGetDatum(larg),
-								   ObjectIdGetDatum(rarg),
-								   ObjectIdGetDatum(proc_namespace));
+	result = GetSysCacheOid4(OPERNAMENSP,
+							 Anum_pg_operator_oid,
+							 input_strings[ENCODED_OP_NAME],
+							 ObjectIdGetDatum(larg),
+							 ObjectIdGetDatum(rarg),
+							 ObjectIdGetDatum(proc_namespace));
 	Assert(result != InvalidOid);
 	return result;
 }
@@ -706,11 +711,7 @@ collect_colstat_slots(const HeapTuple tuple, const Form_pg_statistic formdata, D
 		const int numbers_idx = AttrNumberGetAttrOffset(Anum_chunk_colstats_slot1_numbers) + i;
 		const int values_idx = AttrNumberGetAttrOffset(Anum_chunk_colstats_slot1_values) + i;
 
-#if PG12_GE
 		slot_collation[i] = ObjectIdGetDatum(((Oid *) &formdata->stacoll1)[i]);
-#else
-		slot_collation[i] = 0;
-#endif
 
 		slotkind[i] = ObjectIdGetDatum(kind);
 		if (kind == InvalidOid)
@@ -911,11 +912,9 @@ chunk_update_colstats(Chunk *chunk, int16 attnum, float nullfract, int32 width, 
 	for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
 		values[i++] = Int16GetDatum(slot_kinds[k]); /* stakindN */
 
-#if PG12_GE
 	i = AttrNumberGetAttrOffset(Anum_pg_statistic_stacoll1);
 	for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
 		values[i++] = ObjectIdGetDatum(((Oid *) ARR_DATA_PTR(collations))[k]); /* stacollN */
-#endif
 
 	i = AttrNumberGetAttrOffset(Anum_pg_statistic_staop1);
 	for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
@@ -1397,13 +1396,13 @@ typedef struct ColStatContext
 } ColStatContext;
 
 static void *
-chunk_api_generate_colstats_context(List *oids, Hypertable *ht)
+chunk_api_generate_colstats_context(List *oids, Oid ht_relid)
 {
 	ColStatContext *ctx = palloc0(sizeof(ColStatContext));
 
 	ctx->chunk_oids = list_copy(oids);
 	ctx->col_id = 1;
-	ctx->nattrs = get_relnatts(ht->main_table_relid);
+	ctx->nattrs = get_relnatts(ht_relid);
 
 	return ctx;
 }
@@ -1536,12 +1535,12 @@ chunk_api_get_chunk_stats(FunctionCallInfo fcinfo, bool col_stats)
 		Cache *hcache;
 		Hypertable *ht;
 		List *chunk_oids = NIL;
+		Oid ht_relid = InvalidOid;
 
 		if (!OidIsValid(relid))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid table")));
 
-		hcache = ts_hypertable_cache_pin();
-		ht = ts_hypertable_cache_get_entry(hcache, relid, CACHE_FLAG_MISSING_OK);
+		ht = ts_hypertable_cache_get_cache_and_entry(relid, CACHE_FLAG_MISSING_OK, &hcache);
 
 		if (NULL == ht)
 		{
@@ -1572,6 +1571,8 @@ chunk_api_get_chunk_stats(FunctionCallInfo fcinfo, bool col_stats)
 			chunk_oids = find_inheritance_children(relid, NoLock);
 		}
 
+		if (ht)
+			ht_relid = ht->main_table_relid;
 		ts_cache_release(hcache);
 
 		funcctx = SRF_FIRSTCALL_INIT();
@@ -1586,7 +1587,7 @@ chunk_api_get_chunk_stats(FunctionCallInfo fcinfo, bool col_stats)
 		/* Save the chunk oid list on the multi-call memory context so that it
 		 * survives across multiple calls to this function (until SRF is
 		 * done). */
-		funcctx->user_fctx = col_stats ? chunk_api_generate_colstats_context(chunk_oids, ht) :
+		funcctx->user_fctx = col_stats ? chunk_api_generate_colstats_context(chunk_oids, ht_relid) :
 										 chunk_api_generate_relstats_context(chunk_oids);
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 		MemoryContextSwitchTo(oldcontext);

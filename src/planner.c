@@ -5,24 +5,26 @@
  */
 #include <postgres.h>
 #include <access/tsmapi.h>
-#include <nodes/plannodes.h>
-#include <parser/parsetree.h>
-#include <optimizer/clauses.h>
-#include <optimizer/planner.h>
-#include <optimizer/pathnode.h>
-#include <optimizer/paths.h>
-#include <optimizer/tlist.h>
+#include <access/xact.h>
 #include <catalog/namespace.h>
-#include <utils/elog.h>
-#include <utils/guc.h>
+#include <executor/nodeAgg.h>
 #include <miscadmin.h>
 #include <nodes/makefuncs.h>
+#include <nodes/plannodes.h>
+#include <optimizer/appendinfo.h>
+#include <optimizer/clauses.h>
+#include <optimizer/optimizer.h>
+#include <optimizer/pathnode.h>
+#include <optimizer/paths.h>
+#include <optimizer/planner.h>
 #include <optimizer/restrictinfo.h>
+#include <optimizer/tlist.h>
+#include <parser/parsetree.h>
+#include <utils/elog.h>
+#include <utils/guc.h>
 #include <utils/lsyscache.h>
-#include <executor/nodeAgg.h>
-#include <utils/timestamp.h>
 #include <utils/selfuncs.h>
-#include <access/xact.h>
+#include <utils/timestamp.h>
 
 #include "compat-msvc-enter.h"
 #include <optimizer/cost.h>
@@ -32,15 +34,6 @@
 #include <parser/analyze.h>
 #include <catalog/pg_constraint.h>
 #include "compat-msvc-exit.h"
-
-#include "compat.h"
-
-#if PG11
-#include <optimizer/var.h>
-#else
-#include <optimizer/appendinfo.h>
-#include <optimizer/optimizer.h>
-#endif
 
 #include <math.h>
 
@@ -52,9 +45,9 @@
 #include "utils.h"
 #include "guc.h"
 #include "dimension.h"
-#include "chunk_dispatch_plan.h"
-#include "hypertable_insert.h"
-#include "constraint_aware_append.h"
+#include "nodes/chunk_dispatch_plan.h"
+#include "nodes/hypertable_insert.h"
+#include "nodes/constraint_aware_append/constraint_aware_append.h"
 #include "chunk_append/chunk_append.h"
 #include "partitioning.h"
 #include "dimension_slice.h"
@@ -337,7 +330,8 @@ timescaledb_planner(Query *parse, int cursor_opts, ParamListInfo bound_params)
 			{
 				Plan *subplan = (Plan *) lfirst(lc);
 
-				ts_hypertable_insert_fixup_tlist(subplan);
+				if (subplan)
+					ts_hypertable_insert_fixup_tlist(subplan);
 			}
 		}
 	}
@@ -401,7 +395,7 @@ classify_relation(const PlannerInfo *root, const RelOptInfo *rel, Hypertable **p
 			 * with CACHE_FLAG_CHECK which includes CACHE_FLAG_NOCREATE flag because
 			 * the rel might not be in cache yet.
 			 */
-			ht = get_hypertable(rte->relid, rte->inh ? CACHE_FLAG_MISSING_OK : CACHE_FLAG_CHECK);
+			ht = get_hypertable(rte->relid, CACHE_FLAG_MISSING_OK);
 
 			if (ht != NULL)
 				reltype = TS_REL_HYPERTABLE;
@@ -483,7 +477,12 @@ should_chunk_append(Hypertable *ht, PlannerInfo *root, RelOptInfo *rel, Path *pa
 			 * Params this Path might benefit from startup or runtime exclusion
 			 */
 			{
+				AppendPath *append = castNode(AppendPath, path);
 				ListCell *lc;
+
+				/* Don't create ChunkAppend with no children */
+				if (list_length(append->subpaths) == 0)
+					return false;
 
 				foreach (lc, rel->baserestrictinfo)
 				{
@@ -501,10 +500,11 @@ should_chunk_append(Hypertable *ht, PlannerInfo *root, RelOptInfo *rel, Path *pa
 			 * Can we do ordered append
 			 */
 			{
+				MergeAppendPath *merge = castNode(MergeAppendPath, path);
 				PathKey *pk;
 				ListCell *lc;
 
-				if (!ordered || path->pathkeys == NIL)
+				if (!ordered || path->pathkeys == NIL || list_length(merge->subpaths) == 0)
 					return false;
 
 				pk = linitial_node(PathKey, path->pathkeys);
@@ -563,8 +563,6 @@ should_constraint_aware_append(Hypertable *ht, Path *path)
 
 	return ts_constraint_aware_append_possible(path);
 }
-
-#if PG12_GE
 
 static bool
 rte_should_expand(const RangeTblEntry *rte)
@@ -656,7 +654,6 @@ reenable_inheritance(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntr
 		ts_set_append_rel_pathlist(root, rel, rti, rte);
 	}
 }
-#endif /* PG12_GE */
 
 static void
 apply_optimizations(PlannerInfo *root, TsRelType reltype, RelOptInfo *rel, RangeTblEntry *rte,
@@ -719,7 +716,7 @@ apply_optimizations(PlannerInfo *root, TsRelType reltype, RelOptInfo *rel, Range
 															   ordered,
 															   nested_oids);
 					else if (should_constraint_aware_append(ht, *pathptr))
-						*pathptr = ts_constraint_aware_append_path_create(root, ht, *pathptr);
+						*pathptr = ts_constraint_aware_append_path_create(root, *pathptr);
 					break;
 				default:
 					break;
@@ -738,7 +735,7 @@ apply_optimizations(PlannerInfo *root, TsRelType reltype, RelOptInfo *rel, Range
 						*pathptr =
 							ts_chunk_append_path_create(root, rel, ht, *pathptr, true, false, NIL);
 					else if (should_constraint_aware_append(ht, *pathptr))
-						*pathptr = ts_constraint_aware_append_path_create(root, ht, *pathptr);
+						*pathptr = ts_constraint_aware_append_path_create(root, *pathptr);
 					break;
 				default:
 					break;
@@ -778,11 +775,9 @@ timescaledb_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, Rang
 
 	reltype = classify_relation(root, rel, &ht);
 
-#if PG12_GE
 	/* Check for unexpanded hypertable */
 	if (!rte->inh && rte_is_marked_for_expansion(rte))
 		reenable_inheritance(root, rel, rti, rte);
-#endif
 
 	/* Call other extensions. Do it after table expansion. */
 	if (prev_set_rel_pathlist_hook != NULL)
@@ -832,7 +827,6 @@ timescaledb_get_relation_info_hook(PlannerInfo *root, Oid relation_objectid, boo
 	{
 		case TS_REL_HYPERTABLE:
 		{
-#if PG12_GE
 			/* This only works for PG12 because for earlier versions the inheritance
 			 * expansion happens too early during the planning phase
 			 */
@@ -857,20 +851,8 @@ timescaledb_get_relation_info_hook(PlannerInfo *root, Oid relation_objectid, boo
 			{
 				rte_mark_for_expansion(rte);
 			}
-#endif
 			ts_create_private_reloptinfo(rel);
-#if PG12_GE
-			/* in earlier versions this is done during expand_hypertable_inheritance() below */
 			ts_plan_expand_timebucket_annotate(root, rel);
-#else
-			if (ts_guc_enable_constraint_exclusion && rel->relid != root->parse->resultRelation)
-			{
-				RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
-
-				if (rte_is_marked_for_expansion(rte) && !inhparent)
-					ts_plan_expand_hypertable_chunks(ht, root, rel);
-			}
-#endif
 			break;
 		}
 		case TS_REL_CHUNK:

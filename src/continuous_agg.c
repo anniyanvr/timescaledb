@@ -200,7 +200,7 @@ continuous_agg_init(ContinuousAgg *cagg, const Form_continuous_agg fd)
 {
 	Oid nspid = get_namespace_oid(NameStr(fd->user_view_schema), false);
 	Hypertable *cagg_ht = ts_hypertable_get_by_id(fd->mat_hypertable_id);
-	Dimension *time_dim;
+	const Dimension *time_dim;
 
 	Assert(NULL != cagg_ht);
 	time_dim = hyperspace_get_open_dimension(cagg_ht->space, 0);
@@ -909,15 +909,15 @@ find_raw_hypertable_for_materialization(int32 mat_hypertable_id)
  * Walk the materialization hypertable ->raw hypertable tree till
  * we find a hypertable that has integer_now_func set.
  */
-TSDLLEXPORT Dimension *
+TSDLLEXPORT const Dimension *
 ts_continuous_agg_find_integer_now_func_by_materialization_id(int32 mat_htid)
 {
 	int32 raw_htid = mat_htid;
-	Dimension *par_dim = NULL;
+	const Dimension *par_dim = NULL;
 	while (raw_htid != INVALID_HYPERTABLE_ID)
 	{
 		Hypertable *raw_ht = ts_hypertable_get_by_id(raw_htid);
-		Dimension *open_dim = hyperspace_get_open_dimension(raw_ht->space, 0);
+		const Dimension *open_dim = hyperspace_get_open_dimension(raw_ht->space, 0);
 		if (strlen(NameStr(open_dim->fd.integer_now_func)) != 0 &&
 			strlen(NameStr(open_dim->fd.integer_now_func_schema)) != 0)
 		{
@@ -977,7 +977,7 @@ static Watermark *
 watermark_create(const ContinuousAgg *cagg, MemoryContext top_mctx)
 {
 	Hypertable *ht;
-	Dimension *dim;
+	const Dimension *dim;
 	Datum maxdat;
 	bool max_isnull;
 	Oid timetype;
@@ -1001,12 +1001,13 @@ watermark_create(const ContinuousAgg *cagg, MemoryContext top_mctx)
 	if (!max_isnull)
 	{
 		int64 value;
+		int64 bucket_width = ts_continuous_agg_bucket_width(cagg);
 
 		/* The materialized hypertable is already bucketed, which means the
 		 * max is the start of the last bucket. Add one bucket to move to the
 		 * point where the materialized data ends. */
 		value = ts_time_value_to_internal(maxdat, timetype);
-		w->value = ts_time_saturating_add(value, cagg->data.bucket_width, timetype);
+		w->value = ts_time_saturating_add(value, bucket_width, timetype);
 	}
 	else
 	{
@@ -1066,4 +1067,30 @@ ts_continuous_agg_watermark(PG_FUNCTION_ARGS)
 	watermark = watermark_create(cagg, TopTransactionContext);
 
 	PG_RETURN_INT64(watermark->value);
+}
+
+/*
+ * Determines bucket width for given continuous aggregate.
+ *
+ * Currently all buckets are fixed in size but this is going to change in the
+ * future. Any code that needs to know bucket width has to determine it using
+ * this procedure instead of accessing any ContinuousAgg fields directly.
+ */
+int64
+ts_continuous_agg_bucket_width(const ContinuousAgg *agg)
+{
+	return agg->data.bucket_width;
+}
+
+/*
+ * Determines maximum possible bucket width for given continuous aggregate.
+ *
+ * E.g. for monthly continuous aggreagtes this procedure will return 31 days.
+ * This is not true for ts_continuous_agg_bucket_width which may use additional
+ * arguments to determine the width of a concrete bucket.
+ */
+int64
+ts_continuous_agg_max_bucket_width(const ContinuousAgg *agg)
+{
+	return agg->data.bucket_width;
 }

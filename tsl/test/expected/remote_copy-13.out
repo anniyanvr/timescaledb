@@ -60,9 +60,9 @@ ERROR:  unable to use default value for partitioning column "pH"
 -- Missing required column, these generate a WARNING with a transaction id in them (too flimsy to output)
 SET client_min_messages TO ERROR;
 COPY "+ri(k33_')" (thyme, flavor, "pH") FROM STDIN WITH DELIMITER ',';
-ERROR:  null value in column "))_" of relation "_dist_hyper_1_1_chunk" violates not-null constraint
+ERROR:  [data_node_3]: null value in column "))_" of relation "_dist_hyper_1_1_chunk" violates not-null constraint
 COPY "+ri(k33_')" FROM STDIN WITH DELIMITER ',';
-ERROR:  null value in column "))_" of relation "_dist_hyper_1_4_chunk" violates not-null constraint
+ERROR:  [data_node_2]: null value in column "))_" of relation "_dist_hyper_1_4_chunk" violates not-null constraint
 SET client_min_messages TO INFO;
 -- Invalid data after new chunk creation, data and chunks should be rolled back
 COPY "+ri(k33_')" FROM STDIN WITH DELIMITER ',';
@@ -100,24 +100,24 @@ SELECT * FROM "+ri(k33_')";
 (18 rows)
 
 SELECT * FROM _timescaledb_catalog.chunk;
- id | hypertable_id |      schema_name      |       table_name       | compressed_chunk_id | dropped 
-----+---------------+-----------------------+------------------------+---------------------+---------
-  1 |             1 | _timescaledb_internal | _dist_hyper_1_1_chunk  |                     | f
-  2 |             1 | _timescaledb_internal | _dist_hyper_1_2_chunk  |                     | f
-  3 |             1 | _timescaledb_internal | _dist_hyper_1_3_chunk  |                     | f
-  4 |             1 | _timescaledb_internal | _dist_hyper_1_4_chunk  |                     | f
-  5 |             1 | _timescaledb_internal | _dist_hyper_1_5_chunk  |                     | f
-  6 |             1 | _timescaledb_internal | _dist_hyper_1_6_chunk  |                     | f
-  7 |             1 | _timescaledb_internal | _dist_hyper_1_7_chunk  |                     | f
-  8 |             1 | _timescaledb_internal | _dist_hyper_1_8_chunk  |                     | f
- 12 |             1 | _timescaledb_internal | _dist_hyper_1_12_chunk |                     | f
- 13 |             1 | _timescaledb_internal | _dist_hyper_1_13_chunk |                     | f
- 14 |             1 | _timescaledb_internal | _dist_hyper_1_14_chunk |                     | f
- 15 |             1 | _timescaledb_internal | _dist_hyper_1_15_chunk |                     | f
- 16 |             1 | _timescaledb_internal | _dist_hyper_1_16_chunk |                     | f
- 17 |             1 | _timescaledb_internal | _dist_hyper_1_17_chunk |                     | f
- 18 |             1 | _timescaledb_internal | _dist_hyper_1_18_chunk |                     | f
- 19 |             1 | _timescaledb_internal | _dist_hyper_1_19_chunk |                     | f
+ id | hypertable_id |      schema_name      |       table_name       | compressed_chunk_id | dropped | status 
+----+---------------+-----------------------+------------------------+---------------------+---------+--------
+  1 |             1 | _timescaledb_internal | _dist_hyper_1_1_chunk  |                     | f       |      0
+  2 |             1 | _timescaledb_internal | _dist_hyper_1_2_chunk  |                     | f       |      0
+  3 |             1 | _timescaledb_internal | _dist_hyper_1_3_chunk  |                     | f       |      0
+  4 |             1 | _timescaledb_internal | _dist_hyper_1_4_chunk  |                     | f       |      0
+  5 |             1 | _timescaledb_internal | _dist_hyper_1_5_chunk  |                     | f       |      0
+  6 |             1 | _timescaledb_internal | _dist_hyper_1_6_chunk  |                     | f       |      0
+  7 |             1 | _timescaledb_internal | _dist_hyper_1_7_chunk  |                     | f       |      0
+  8 |             1 | _timescaledb_internal | _dist_hyper_1_8_chunk  |                     | f       |      0
+ 12 |             1 | _timescaledb_internal | _dist_hyper_1_12_chunk |                     | f       |      0
+ 13 |             1 | _timescaledb_internal | _dist_hyper_1_13_chunk |                     | f       |      0
+ 14 |             1 | _timescaledb_internal | _dist_hyper_1_14_chunk |                     | f       |      0
+ 15 |             1 | _timescaledb_internal | _dist_hyper_1_15_chunk |                     | f       |      0
+ 16 |             1 | _timescaledb_internal | _dist_hyper_1_16_chunk |                     | f       |      0
+ 17 |             1 | _timescaledb_internal | _dist_hyper_1_17_chunk |                     | f       |      0
+ 18 |             1 | _timescaledb_internal | _dist_hyper_1_18_chunk |                     | f       |      0
+ 19 |             1 | _timescaledb_internal | _dist_hyper_1_19_chunk |                     | f       |      0
 (16 rows)
 
 SELECT * FROM _timescaledb_catalog.chunk_data_node;

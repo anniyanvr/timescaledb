@@ -10,14 +10,10 @@
 #include <access/htup_details.h>
 #include <catalog/pg_proc.h>
 #include <common/int.h>
+#include <nodes/pathnodes.h>
 #include <utils/datetime.h>
 
 #include "compat.h"
-#if PG12_GE
-#include <nodes/pathnodes.h>
-#else
-#include <nodes/relation.h>
-#endif
 
 #define MAX(x, y) ((x) > (y) ? x : y)
 #define MIN(x, y) ((x) < (y) ? x : y)
@@ -70,7 +66,7 @@ extern int64 ts_date_trunc_interval_period_approx(text *units);
  */
 extern TSDLLEXPORT int64 ts_get_interval_period_approx(Interval *interval);
 
-extern Oid ts_inheritance_parent_relid(Oid relid);
+extern TSDLLEXPORT Oid ts_inheritance_parent_relid(Oid relid);
 
 extern Oid ts_lookup_proc_filtered(const char *schema, const char *funcname, Oid *rettype,
 								   proc_filter filter, void *filter_arg);
@@ -135,6 +131,24 @@ int64_saturating_sub(int64 a, int64 b)
 	if (overflowed)
 		result = b < 0 ? PG_INT64_MAX : PG_INT64_MIN;
 	return result;
+}
+
+static inline bool
+ts_flags_are_set_32(uint32 bitmap, uint32 flags)
+{
+	return (bitmap & flags) == flags;
+}
+
+static inline uint32
+ts_set_flags_32(uint32 bitmap, uint32 flags)
+{
+	return bitmap | flags;
+}
+
+static inline uint32
+ts_clear_flags_32(uint32 bitmap, uint32 flags)
+{
+	return bitmap & ~flags;
 }
 
 #endif /* TIMESCALEDB_UTILS_H */

@@ -7,7 +7,7 @@
 #
 set -e
 
-PG_MAJOR=${PG_MAJOR:-11}
+PG_MAJOR=${PG_MAJOR:-12}
 PG_MINOR_COMPILE=${PG_MINOR_COMPILE:-0}
 
 
@@ -35,10 +35,10 @@ create_base_container() {
   docker run -u postgres -d -e POSTGRES_HOST_AUTH_METHOD=trust --name $1 -v ${BASE_DIR}:/src -v ${COMPILE_VOLUME}:/compile $2
 
   # Install build dependencies
-  docker exec -u root $1 /bin/bash -c "apk add --no-cache --virtual .build-deps coreutils dpkg-dev gcc libc-dev make util-linux-dev diffutils cmake bison flex openssl-dev && mkdir -p /build/debug"
+  docker exec -u root $1 /bin/bash -c "apk add --no-cache --virtual .build-deps coreutils dpkg-dev gcc libc-dev make util-linux-dev diffutils cmake bison flex openssl-dev perl perl-utils perl-test-harness-utils perl-ipc-run && mkdir -p /build/debug "
 
   # Copy the source files to build directory
-  docker exec -u root $1 /bin/bash -c "cp -a /src/{src,sql,scripts,test,tsl,CMakeLists.txt,timescaledb.control.in,version.config} /build/ && cd /build/debug/ && CFLAGS=-Werror cmake .. -DCMAKE_BUILD_TYPE=Debug -DREGRESS_CHECKS=OFF && make -C /build/debug install && chown -R postgres /build"
+  docker exec -u root $1 /bin/bash -c "cp -a /src/{src,sql,scripts,test,tsl,cmake,CMakeLists.txt,timescaledb.control.in,version.config} /build/ && cd /build/debug/ && CFLAGS=-Werror cmake .. -DCMAKE_BUILD_TYPE=Debug -DREGRESS_CHECKS=OFF && make -C /build/debug install && chown -R postgres /build"
 }
 
 create_base_container $CONTAINER_NAME_COMPILE $PG_IMAGE_TAG_COMPILE

@@ -22,7 +22,7 @@ jobs:
         # Debian images:  9 (stretch), or 10 (buster)
         # Ubuntu images:  18.04 LTS (bionic), 19.10 (eoan), 20.04 LTS (focal)
         image: [ "debian:9-slim", "debian:10-slim", "ubuntu:bionic", "ubuntu:focal"]
-        pg: [ 11, 12, 13 ]
+        pg: [ 12, 13 ]
 
     steps:
     - name: Add repositories
@@ -70,13 +70,3 @@ jobs:
         if [ "$version" != "$installed_version" ];then
           false
         fi
-
-    - name: Slack Notification
-      if: failure() && github.event_name != 'pull_request'
-      env:
-        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-        SLACK_COLOR: '#ff0000'
-        SLACK_USERNAME: GitHub Action
-        SLACK_TITLE: APT Package ${{ matrix.image }} PG${{ matrix.pg }} ${{ job.status }}
-        SLACK_MESSAGE: ${{ github.event.head_commit.message }}
-      uses: rtCamp/action-slack-notify@v2.0.2

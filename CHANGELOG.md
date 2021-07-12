@@ -7,12 +7,160 @@ accidentally triggering the load of a previous DB version.**
 ## Unreleased
 
 **Bugfixes**
-* #2989 Refactor and harden size and stats functions
-* #3058 Reduce memory usage for distributed inserts
+* #3401 Fix segfault for RelOptInfo without fdw_private
 
 **Thanks**
+* @fvannee for reporting an issue with hypertable expansion in functions
+
+## 2.3.1 (2021-07-05)
+
+This maintenance release contains bugfixes since the 2.3.0 release. We
+deem it moderate priority for upgrading. The release introduces the
+possibility of generating downgrade scripts, improves the trigger
+handling for distributed hypertables, adds some more randomness to
+chunk assignment to avoid thundering herd issues in chunk assignment,
+and fixes some issues in update handling as well as some other bugs.
+
+**Bugfixes**
+* #3279 Add some more randomness to chunk assignment
+* #3288 Fix failed update with parallel workers
+* #3300 Improve trigger handling on distributed hypertables
+* #3304 Remove paths that reference parent relids for compressed chunks
+* #3305 Fix pull_varnos miscomputation of relids set
+* #3310 Generate downgrade script
+* #3314 Fix heap buffer overflow in hypertable expansion
+* #3317 Fix heap buffer overflow in remote connection cache.
+* #3327 Make aggregates in caggs fully qualified
+* #3336 Fix pg_init_privs objsubid handling
+* #3345 Fix SkipScan distinct column identification
+* #3355 Fix heap buffer overflow when renaming compressed hypertable columns.
+* #3367 Improve DecompressChunk qual pushdown
+* #3377 Fix bad use of repalloc
+
+**Thanks**
+* @db-adrian for reporting an issue when accessing cagg view through postgres_fdw
+* @fncaldas and @pgwhalen for reporting an issue accessing caggs when public is not in search_path
+* @fvannee, @mglonnro and @ebreijo for reporting an issue with the upgrade script
+* @fvannee for reporting a performance regression with SkipScan
+
+## 2.3.0 (2021-05-25)
+
+This release adds major new features since the 2.2.1 release.
+We deem it moderate priority for upgrading.
+
+This release adds support for inserting data into compressed chunks
+and improves performance when inserting data into distributed hypertables. 
+Distributed hypertables now also support triggers and compression policies.
+
+The bug fixes in this release address issues related to the handling
+of privileges on compressed hypertables, locking, and triggers with transition tables.
+
+**Features**
+* #3116 Add distributed hypertable compression policies
+* #3162 Use COPY when executing distributed INSERTs
+* #3199 Add GENERATED column support on distributed hypertables
+* #3210 Add trigger support on distributed hypertables
+* #3230 Support for inserts into compressed chunks
+
+**Bugfixes**
+* #3213 Propagate grants to compressed hypertables
+* #3229 Use correct lock mode when updating chunk
+* #3243 Fix assertion failure in decompress_chunk_plan_create
+* #3250 Fix constraint triggers on hypertables
+* #3251 Fix segmentation fault due to incorrect call to chunk_scan_internal
+* #3252 Fix blocking triggers with transition tables
+
+**Thanks**
+* @yyjdelete for reporting a crash with decompress_chunk and identifying the bug in the code
+* @fabriziomello for documenting the prerequisites when compiling against PostgreSQL 13
+
+## 2.2.1 (2021-05-05)
+
+This maintenance release contains bugfixes since the 2.2.0 release. We
+deem it high priority for upgrading.
+
+This release extends Skip Scan to multinode by enabling the pushdown
+of `DISTINCT` to data nodes. It also fixes a number of bugs in the
+implementation of Skip Scan, in distributed hypertables, in creation
+of indexes, in compression, and in policies.
+
+**Features**
+* #3113 Pushdown "SELECT DISTINCT" in multi-node to allow use of Skip
+  Scan
+
+**Bugfixes**
+* #3101 Use commit date in `get_git_commit()`
+* #3102 Fix `REINDEX TABLE` for distributed hypertables
+* #3104 Fix use after free in `add_reorder_policy`
+* #3106 Fix use after free in `chunk_api_get_chunk_stats`
+* #3109 Copy recreated object permissions on update
+* #3111 Fix `CMAKE_BUILD_TYPE` check
+* #3112 Use `%u` to format Oid instead of `%d`
+* #3118 Fix use after free in cache
+* #3123 Fix crash while using `REINDEX TABLE CONCURRENTLY`
+* #3135 Fix SkipScan path generation in `DISTINCT` queries with expressions
+* #3146 Fix SkipScan for IndexPaths without pathkeys
+* #3147 Skip ChunkAppend if AppendPath has no children
+* #3148 Make `SELECT DISTINCT` handle non-var targetlists
+* #3151 Fix `fdw_relinfo_get` assertion failure on `DELETE`
+* #3155 Inherit `CFLAGS` from PostgreSQL
+* #3169 Fix incorrect type cast in compression policy
+* #3183 Fix segfault in calculate_chunk_interval 
+* #3185 Fix wrong datatype for integer based retention policy
+
+**Thanks**
+* @Dead2, @dv8472 and @einsibjarni for reporting an issue with multinode queries and views
+* @aelg for reporting an issue with policies on integer-based hypertables
+* @hperez75 for reporting an issue with Skip Scan
+* @nathanloisel for reporting an issue with compression on hypertables with integer-based timestamps
+* @xin-hedera for fixing an issue with compression on hypertables with integer-based timestamps
+
+## 2.2.0 (2021-04-13)
+
+This release adds major new features since the 2.1.1 release.
+We deem it moderate priority for upgrading.
+
+This release adds the Skip Scan optimization, which significantly 
+improves the performance of queries with DISTINCT ON. This 
+optimization is not yet available for queries on distributed 
+hypertables.
+
+This release also adds a function to create a distributed 
+restore point, which allows performing a consistent restore of a 
+multi-node cluster from a backup.
+
+The bug fixes in this release address issues with size and stats 
+functions, high memory usage in distributed inserts, slow distributed 
+ORDER BY queries, indexes involving INCLUDE, and single chunk query 
+planning.
+
+**PostgreSQL 11 deprecation announcement**
+
+Timescale is working hard on our next exciting features. To make that 
+possible, we require functionality that is unfortunately absent on 
+PostgreSQL 11. For this reason, we will continue supporting PostgreSQL 
+11 until mid-June 2021. Sooner to that time, we will announce the 
+specific version of TimescaleDB in which PostgreSQL 11 support will 
+not be included going forward.
+
+**Major Features**
+* #2843 Add distributed restore point functionality
+* #3000 SkipScan to speed up SELECT DISTINCT
+
+**Bugfixes**
+* #2989 Refactor and harden size and stats functions
+* #3058 Reduce memory usage for distributed inserts
+* #3067 Fix extremely slow multi-node order by queries
+* #3082 Fix chunk index column name mapping
+* #3083 Keep Append pathkeys in ChunkAppend
+
+**Thanks**
+* @BowenGG for reporting an issue with indexes with INCLUDE
+* @fvannee for reporting an issue with ChunkAppend pathkeys
 * @pedrokost and @RobAtticus for reporting an issue with size
   functions on empty hypertables
+* @phemmer and @ryanbooz for reporting issues with slow
+  multi-node order by queries
 * @stephane-moreau for reporting an issue with high memory usage during
   single-transaction inserts on a distributed hypertable.
 

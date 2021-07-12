@@ -342,32 +342,6 @@ interval_to_int64(Datum interval, Oid type)
 	return 0;
 }
 
-static const char *
-two_buckets_to_str(const ContinuousAgg *cagg)
-{
-	Oid bucket_type;
-	Oid outfuncid;
-	int64 two_buckets;
-	Datum min_range;
-	bool isvarlena;
-
-	if (IS_TIMESTAMP_TYPE(cagg->partition_type))
-		bucket_type = INTERVALOID;
-	else
-		bucket_type = cagg->partition_type;
-
-	two_buckets = ts_time_saturating_add(cagg->data.bucket_width,
-										 cagg->data.bucket_width,
-										 cagg->partition_type);
-
-	min_range = ts_internal_to_interval_value(two_buckets, bucket_type);
-
-	getTypeOutputInfo(bucket_type, &outfuncid, &isvarlena);
-	Assert(!isvarlena);
-
-	return DatumGetCString(OidFunctionCall1(outfuncid, min_range));
-}
-
 /*
  * Enforce that a policy has a refresh window of at least two buckets to
  * ensure we materialize at least one bucket each run.
@@ -384,6 +358,7 @@ validate_window_size(const ContinuousAgg *cagg, const CaggPolicyConfig *config)
 {
 	int64 start_offset;
 	int64 end_offset;
+	int64 max_bucket_width;
 
 	if (config->offset_start.isnull)
 		start_offset = ts_time_get_max(cagg->partition_type);
@@ -395,16 +370,14 @@ validate_window_size(const ContinuousAgg *cagg, const CaggPolicyConfig *config)
 	else
 		end_offset = interval_to_int64(config->offset_end.value, config->offset_end.type);
 
-	if (ts_time_saturating_add(end_offset, cagg->data.bucket_width * 2, INT8OID) > start_offset)
+	max_bucket_width = ts_continuous_agg_max_bucket_width(cagg);
+	if (ts_time_saturating_add(end_offset, max_bucket_width * 2, INT8OID) > start_offset)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("policy refresh window too small"),
 				 errdetail("The start and end offsets must cover at least"
 						   " two buckets in the valid time range of type \"%s\".",
-						   format_type_be(cagg->partition_type)),
-				 errhint("Use a start and end offset that specifies"
-						 " a window of at least %s.",
-						 two_buckets_to_str(cagg))));
+						   format_type_be(cagg->partition_type))));
 }
 
 static void
@@ -449,7 +422,6 @@ Datum
 policy_refresh_cagg_add(PG_FUNCTION_ARGS)
 {
 	NameData application_name;
-	NameData refresh_name;
 	NameData proc_name, proc_schema, owner;
 	ContinuousAgg *cagg;
 	CaggPolicyConfig policyconf;
@@ -531,7 +503,6 @@ policy_refresh_cagg_add(PG_FUNCTION_ARGS)
 
 	/* Next, insert a new job into jobs table */
 	namestrcpy(&application_name, "Refresh Continuous Aggregate Policy");
-	namestrcpy(&refresh_name, "custom");
 	namestrcpy(&proc_name, POLICY_REFRESH_CAGG_PROC_NAME);
 	namestrcpy(&proc_schema, INTERNAL_SCHEMA_NAME);
 	namestrcpy(&owner, GetUserNameFromId(owner_id, false));
@@ -557,7 +528,6 @@ policy_refresh_cagg_add(PG_FUNCTION_ARGS)
 	Jsonb *config = JsonbValueToJsonb(result);
 
 	job_id = ts_bgw_job_insert_relation(&application_name,
-										&refresh_name,
 										&refresh_interval,
 										DEFAULT_MAX_RUNTIME,
 										DEFAULT_MAX_RETRIES,

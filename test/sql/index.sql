@@ -280,6 +280,10 @@ SELECT * FROM test.show_subtables('reindex_test');
 REINDEX (VERBOSE) TABLE reindex_test;
 
 \set ON_ERROR_STOP 0
+
+-- REINDEX TABLE CONCURRENTLY is not supported on PG11 (but blocked on PG12+)
+REINDEX TABLE CONCURRENTLY reindex_test;
+
 -- this one currently doesn't recurse to chunks and instead gives an
 -- error
 REINDEX (VERBOSE) INDEX reindex_test_time_unique_idx;
@@ -329,4 +333,13 @@ FROM
   LEFT JOIN LATERAL ( SELECT * FROM test.show_indexes (ch.oid)) i ON TRUE
 ORDER BY
   1, 2;
+
+-- #3056 check chunk index column name mapping
+CREATE TABLE i3056(c int, order_number int NOT NULL, date_created timestamptz NOT NULL);
+CREATE INDEX ON i3056(order_number) INCLUDE(order_number);
+CREATE INDEX ON i3056(date_created, (order_number % 5)) INCLUDE(order_number);
+SELECT table_name FROM create_hypertable('i3056', 'date_created');
+ALTER TABLE i3056 DROP COLUMN c;
+INSERT INTO i3056(order_number,date_created) VALUES (1, '2000-01-01');
+
 

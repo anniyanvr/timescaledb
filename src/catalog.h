@@ -357,6 +357,7 @@ enum Anum_chunk
 	Anum_chunk_table_name,
 	Anum_chunk_compressed_chunk_id,
 	Anum_chunk_dropped,
+	Anum_chunk_status,
 	_Anum_chunk_max,
 };
 
@@ -370,6 +371,7 @@ typedef struct FormData_chunk
 	NameData table_name;
 	int32 compressed_chunk_id;
 	bool dropped;
+	int32 status;
 } FormData_chunk;
 
 typedef FormData_chunk *Form_chunk;
@@ -869,6 +871,12 @@ typedef struct FormData_continuous_agg
 	NameData user_view_name;
 	NameData partial_view_schema;
 	NameData partial_view_name;
+	/*
+	 * Don't access bucket_width directly to determine the width of the bucket.
+	 * Use corresponding procedures instead:
+	 * - ts_continuous_agg_bucket_width
+	 * - ts_continuous_agg_max_bucket_width
+	 */
 	int64 bucket_width;
 	NameData direct_view_schema;
 	NameData direct_view_name;
@@ -1244,7 +1252,7 @@ catalog_get_index(Catalog *catalog, CatalogTable tableid, int indexid)
 	return (indexid == INVALID_INDEXID) ? InvalidOid : catalog->tables[tableid].index_ids[indexid];
 }
 
-extern TSDLLEXPORT int64 ts_catalog_table_next_seq_id(Catalog *catalog, CatalogTable table);
+extern TSDLLEXPORT int64 ts_catalog_table_next_seq_id(const Catalog *catalog, CatalogTable table);
 extern Oid ts_catalog_get_cache_proxy_id(Catalog *catalog, CacheType type);
 
 /* Functions that modify the actual catalog table on disk */

@@ -34,11 +34,17 @@ jobs:
       CXX: ${{ matrix.cxx }}
 
     steps:
-    - name: Install Dependencies
+    - name: Install Linux Dependencies
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
-        sudo apt-get install flex bison lcov systemd-coredump gdb ${{ matrix.extra_packages }}
+        sudo apt-get install flex bison lcov systemd-coredump gdb libipc-run-perl libtest-most-perl ${{ matrix.extra_packages }}
+
+    - name: Install macOS Dependencies using Perl
+      if: runner.os == 'macOS'
+      run: |
+        sudo perl -MCPAN -e "CPAN::Shell->notest('install', 'IPC::Run')"
+        sudo perl -MCPAN -e "CPAN::Shell->notest('install', 'Test::Most')"
 
     # on macOS the path used is depending on the runner version leading to cache failure
     # when the runner version changes so we extract runner version from path and add it
@@ -160,13 +166,3 @@ jobs:
       with:
         name: Coredumps ${{ matrix.os }} ${{ matrix.name }} ${{ matrix.pg }}
         path: coredumps
-
-    - name: Slack Notification
-      if: failure() && github.event_name != 'pull_request'
-      env:
-        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-        SLACK_COLOR: '#ff0000'
-        SLACK_USERNAME: GitHub Action
-        SLACK_TITLE: Regression ${{ matrix.os }} PG${{ matrix.pg }} ${{ matrix.name }} ${{ job.status }}
-        SLACK_MESSAGE: ${{ github.event.head_commit.message }}
-      uses: rtCamp/action-slack-notify@v2.0.2

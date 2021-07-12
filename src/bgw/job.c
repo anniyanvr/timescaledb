@@ -40,25 +40,6 @@
 
 #define TELEMETRY_INITIAL_NUM_RUNS 12
 
-#if PG12_LT
-static VirtualTransactionId *
-GetLockConflictsCompat(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
-{
-	VirtualTransactionId *ids = GetLockConflicts(locktag, lockmode);
-	if (countp != NULL)
-	{
-		for (*countp = 0; VirtualTransactionIdIsValid(ids[*countp]); (*countp)++)
-		{
-			/* Counts the number of virtual transactions ids into countp */
-		}
-	}
-	return ids;
-}
-#else
-#define GetLockConflictsCompat(locktag, lockmode, countp)                                          \
-	GetLockConflicts(locktag, lockmode, countp)
-#endif
-
 static scheduler_test_hook_type scheduler_test_hook = NULL;
 static char *job_entrypoint_function_name = "ts_bgw_job_entrypoint";
 static bool is_telemetry_job(BgwJob *job);
@@ -145,7 +126,7 @@ bgw_job_accum_tuple_found(TupleInfo *ti, void *data)
 }
 
 static ScanFilterResult
-bgw_job_filter_scheduled(TupleInfo *ti, void *data)
+bgw_job_filter_scheduled(const TupleInfo *ti, void *data)
 {
 	bool isnull;
 	Datum scheduled = slot_getattr(ti->slot, Anum_bgw_job_scheduled, &isnull);
@@ -490,7 +471,7 @@ get_job_lock_for_delete(int32 job_id)
 	{
 		/* If I couldn't get a lock, try killing the background worker that's running the job.
 		 * This is probably not bulletproof but best-effort is good enough here. */
-		VirtualTransactionId *vxid = GetLockConflictsCompat(&tag, AccessExclusiveLock, NULL);
+		VirtualTransactionId *vxid = GetLockConflicts(&tag, AccessExclusiveLock, NULL);
 		PGPROC *proc;
 
 		if (VirtualTransactionIdIsValid(*vxid))
@@ -871,7 +852,7 @@ ts_bgw_job_run_and_set_next_start(BgwJob *job, job_main_func func, int64 initial
 }
 
 int
-ts_bgw_job_insert_relation(Name application_name, Name job_type, Interval *schedule_interval,
+ts_bgw_job_insert_relation(Name application_name, Interval *schedule_interval,
 						   Interval *max_runtime, int32 max_retries, Interval *retry_period,
 						   Name proc_schema, Name proc_name, Name owner, bool scheduled,
 						   int32 hypertable_id, Jsonb *config)

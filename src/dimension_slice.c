@@ -38,7 +38,7 @@ dimension_slice_alloc(void)
 }
 
 static inline DimensionSlice *
-dimension_slice_from_form_data(Form_dimension_slice fd)
+dimension_slice_from_form_data(const Form_dimension_slice fd)
 {
 	DimensionSlice *slice = dimension_slice_alloc();
 
@@ -102,20 +102,11 @@ ts_dimension_slice_cmp_coordinate(const DimensionSlice *slice, int64 coord)
 static bool
 tuple_is_deleted(TupleInfo *ti)
 {
-#if PG12_GE
 #ifdef USE_ASSERT_CHECKING
 	if (ti->lockresult == TM_Deleted)
 		Assert(ItemPointerEquals(ts_scanner_get_tuple_tid(ti), &ti->lockfd.ctid));
 #endif
 	return ti->lockresult == TM_Deleted;
-#else
-	/* If the tid and ctid in the lock failure data is the same, then this is
-	 * a delete. Otherwise it is an update and ctid is the new tuple ID. This
-	 * applies mostly to PG11, since PG12 has an explicit lockresult for
-	 * deleted tuples. */
-	return ti->lockresult == TM_Updated &&
-		   ItemPointerEquals(ts_scanner_get_tuple_tid(ti), &ti->lockfd.ctid);
-#endif
 }
 
 static void
@@ -128,9 +119,7 @@ lock_result_ok_or_abort(TupleInfo *ti)
 		case TM_SelfModified:
 		case TM_Ok:
 			break;
-#if PG12_GE
 		case TM_Deleted:
-#endif
 		case TM_Updated:
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
@@ -170,9 +159,7 @@ dimension_vec_tuple_found(TupleInfo *ti, void *data)
 		case TM_SelfModified:
 		case TM_Ok:
 			break;
-#if PG12_GE
 		case TM_Deleted:
-#endif
 		case TM_Updated:
 			/* Treat as not found */
 			return SCAN_CONTINUE;
@@ -192,7 +179,7 @@ static int
 dimension_slice_scan_limit_direction_internal(int indexid, ScanKeyData *scankey, int nkeys,
 											  tuple_found_func on_tuple_found, void *scandata,
 											  int limit, ScanDirection scandir, LOCKMODE lockmode,
-											  ScanTupLock *tuplock, MemoryContext mctx)
+											  const ScanTupLock *tuplock, MemoryContext mctx)
 {
 	Catalog *catalog = ts_catalog_get();
 	ScannerCtx scanctx = {
@@ -215,7 +202,8 @@ dimension_slice_scan_limit_direction_internal(int indexid, ScanKeyData *scankey,
 static int
 dimension_slice_scan_limit_internal(int indexid, ScanKeyData *scankey, int nkeys,
 									tuple_found_func on_tuple_found, void *scandata, int limit,
-									LOCKMODE lockmode, ScanTupLock *tuplock, MemoryContext mctx)
+									LOCKMODE lockmode, const ScanTupLock *tuplock,
+									MemoryContext mctx)
 {
 	return dimension_slice_scan_limit_direction_internal(indexid,
 														 scankey,
@@ -235,7 +223,8 @@ dimension_slice_scan_limit_internal(int indexid, ScanKeyData *scankey, int nkeys
  * Returns a dimension vector of slices that enclose the coordinate.
  */
 DimensionVec *
-ts_dimension_slice_scan_limit(int32 dimension_id, int64 coordinate, int limit, ScanTupLock *tuplock)
+ts_dimension_slice_scan_limit(int32 dimension_id, int64 coordinate, int limit,
+							  const ScanTupLock *tuplock)
 {
 	ScanKeyData scankey[3];
 	DimensionVec *slices = ts_dimension_vec_create(limit > 0 ? limit : DIMENSION_VEC_DEFAULT_SIZE);
@@ -279,7 +268,7 @@ static void
 dimension_slice_scan_with_strategies(int32 dimension_id, StrategyNumber start_strategy,
 									 int64 start_value, StrategyNumber end_strategy,
 									 int64 end_value, void *data, tuple_found_func tuple_found,
-									 int limit, ScanTupLock *tuplock)
+									 int limit, const ScanTupLock *tuplock)
 {
 	ScanKeyData scankey[3];
 	int nkeys = 1;
@@ -362,7 +351,7 @@ dimension_slice_scan_with_strategies(int32 dimension_id, StrategyNumber start_st
 DimensionVec *
 ts_dimension_slice_scan_range_limit(int32 dimension_id, StrategyNumber start_strategy,
 									int64 start_value, StrategyNumber end_strategy, int64 end_value,
-									int limit, ScanTupLock *tuplock)
+									int limit, const ScanTupLock *tuplock)
 {
 	DimensionVec *slices = ts_dimension_vec_create(limit > 0 ? limit : DIMENSION_VEC_DEFAULT_SIZE);
 
@@ -573,9 +562,7 @@ dimension_slice_fill(TupleInfo *ti, void *data)
 				heap_freetuple(tuple);
 			break;
 		}
-#if PG12_GE
 		case TM_Deleted:
-#endif
 		case TM_Updated:
 			/* Same as not found */
 			break;
@@ -597,7 +584,7 @@ dimension_slice_fill(TupleInfo *ti, void *data)
  * otherwise.
  */
 bool
-ts_dimension_slice_scan_for_existing(DimensionSlice *slice, ScanTupLock *tuplock)
+ts_dimension_slice_scan_for_existing(const DimensionSlice *slice, const ScanTupLock *tuplock)
 {
 	ScanKeyData scankey[3];
 
@@ -622,7 +609,7 @@ ts_dimension_slice_scan_for_existing(DimensionSlice *slice, ScanTupLock *tuplock
 		scankey,
 		3,
 		dimension_slice_fill,
-		&slice,
+		(DimensionSlice **) &slice,
 		1,
 		AccessShareLock,
 		tuplock,
@@ -649,7 +636,7 @@ dimension_slice_tuple_found(TupleInfo *ti, void *data)
  * concurrent threads can do bad things with the tuple and you probably want
  * it to not change nor disappear. */
 DimensionSlice *
-ts_dimension_slice_scan_by_id_and_lock(int32 dimension_slice_id, ScanTupLock *tuplock,
+ts_dimension_slice_scan_by_id_and_lock(int32 dimension_slice_id, const ScanTupLock *tuplock,
 									   MemoryContext mctx)
 {
 	DimensionSlice *slice = NULL;
@@ -693,7 +680,7 @@ ts_dimension_slice_copy(const DimensionSlice *original)
  * Returns true if the slices collide, otherwise false.
  */
 bool
-ts_dimension_slices_collide(DimensionSlice *slice1, DimensionSlice *slice2)
+ts_dimension_slices_collide(const DimensionSlice *slice1, const DimensionSlice *slice2)
 {
 	Assert(slice1->fd.dimension_id == slice2->fd.dimension_id);
 
@@ -710,7 +697,7 @@ ts_dimension_slices_collide(DimensionSlice *slice1, DimensionSlice *slice2)
  * Returns true if the slices have identical ranges, otherwise false.
  */
 bool
-ts_dimension_slices_equal(DimensionSlice *slice1, DimensionSlice *slice2)
+ts_dimension_slices_equal(const DimensionSlice *slice1, const DimensionSlice *slice2)
 {
 	Assert(slice1->fd.dimension_id == slice2->fd.dimension_id);
 
@@ -735,7 +722,7 @@ ts_dimension_slices_equal(DimensionSlice *slice1, DimensionSlice *slice2)
  * Returns true if the slice was cut, otherwise false.
  */
 bool
-ts_dimension_slice_cut(DimensionSlice *to_cut, DimensionSlice *other, int64 coord)
+ts_dimension_slice_cut(DimensionSlice *to_cut, const DimensionSlice *other, int64 coord)
 {
 	Assert(to_cut->fd.dimension_id == other->fd.dimension_id);
 
@@ -768,7 +755,7 @@ ts_dimension_slice_free(DimensionSlice *slice)
 }
 
 static bool
-dimension_slice_insert_relation(Relation rel, DimensionSlice *slice)
+dimension_slice_insert_relation(const Relation rel, DimensionSlice *slice)
 {
 	TupleDesc desc = RelationGetDescr(rel);
 	Datum values[Natts_dimension_slice];
@@ -897,7 +884,7 @@ dimension_slice_check_chunk_stats_tuple_found(TupleInfo *ti, void *data)
 		BgwPolicyChunkStats *chunk_stat = ts_bgw_policy_chunk_stats_find(info->job_id, chunk_id);
 
 		if ((chunk_stat == NULL || chunk_stat->fd.num_times_job_run == 0) &&
-			ts_chunk_can_be_compressed(chunk_id))
+			ts_chunk_get_compression_status(chunk_id) == CHUNK_COMPRESS_NONE)
 		{
 			/* Save the chunk_id */
 			info->chunk_id = chunk_id;
@@ -931,22 +918,34 @@ ts_dimension_slice_oldest_valid_chunk_for_reorder(int32 job_id, int32 dimension_
 	return info.chunk_id;
 }
 
+typedef struct CompressChunkSearch
+{
+	int32 chunk_id;
+	bool compress;
+	bool recompress;
+} CompressChunkSearch;
+
 static ScanTupleResult
 dimension_slice_check_is_chunk_uncompressed_tuple_found(TupleInfo *ti, void *data)
 {
 	ListCell *lc;
 	DimensionSlice *slice = dimension_slice_from_slot(ti->slot);
 	List *chunk_ids = NIL;
+	CompressChunkSearch *d = data;
 
 	ts_chunk_constraint_scan_by_dimension_slice_to_list(slice, &chunk_ids, CurrentMemoryContext);
 
 	foreach (lc, chunk_ids)
 	{
 		int32 chunk_id = lfirst_int(lc);
-		if (ts_chunk_can_be_compressed(chunk_id))
+		ChunkCompressionStatus st = ts_chunk_get_compression_status(chunk_id);
+		if ((d->compress && st == CHUNK_COMPRESS_NONE) ||
+			(d->recompress && st == CHUNK_COMPRESS_UNORDERED))
 		{
-			/* found a chunk that has not yet been compressed */
-			*((int32 *) data) = chunk_id;
+			/* found a chunk that is not compressed or needs recompress
+			 * caller needs to check the correct chunk status
+			 */
+			d->chunk_id = chunk_id;
 			return SCAN_DONE;
 		}
 	}
@@ -957,18 +956,20 @@ dimension_slice_check_is_chunk_uncompressed_tuple_found(TupleInfo *ti, void *dat
 int32
 ts_dimension_slice_get_chunkid_to_compress(int32 dimension_id, StrategyNumber start_strategy,
 										   int64 start_value, StrategyNumber end_strategy,
-										   int64 end_value)
+										   int64 end_value, bool compress, bool recompress)
 {
-	int32 chunk_id_ret = INVALID_CHUNK_ID;
+	CompressChunkSearch data = { .compress = compress,
+								 .recompress = recompress,
+								 .chunk_id = INVALID_CHUNK_ID };
 	dimension_slice_scan_with_strategies(dimension_id,
 										 start_strategy,
 										 start_value,
 										 end_strategy,
 										 end_value,
-										 &chunk_id_ret,
+										 &data,
 										 dimension_slice_check_is_chunk_uncompressed_tuple_found,
 										 -1,
 										 NULL);
 
-	return chunk_id_ret;
+	return data.chunk_id;
 }

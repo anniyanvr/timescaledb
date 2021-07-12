@@ -12,25 +12,13 @@
 #include <nodes/extensible.h>
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
+#include <optimizer/optimizer.h>
 #include <optimizer/paths.h>
 #include <optimizer/restrictinfo.h>
 #include <optimizer/tlist.h>
 #include <parser/parsetree.h>
 #include <utils/builtins.h>
 #include <utils/typcache.h>
-
-#include "compat.h"
-#if PG12_LT
-#include <optimizer/clauses.h>
-#include <optimizer/pathnode.h>
-#include <optimizer/placeholder.h>
-#include <optimizer/planmain.h>
-#include <optimizer/prep.h>
-#include <optimizer/subselect.h>
-#include <optimizer/var.h>
-#else
-#include <optimizer/optimizer.h>
-#endif
 
 #include "compression/compression.h"
 #include "compression/create.h"
@@ -289,6 +277,7 @@ decompress_chunk_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *pat
 	Scan *compressed_scan = linitial(custom_plans);
 	Path *compressed_path = linitial(path->custom_paths);
 	List *settings;
+	ListCell *lc;
 
 	Assert(list_length(custom_plans) == 1);
 	Assert(list_length(path->custom_paths) == 1);
@@ -306,7 +295,6 @@ decompress_chunk_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *pat
 	{
 		/* from create_indexscan_plan() */
 		IndexPath *ipath = castNode(IndexPath, compressed_path);
-		ListCell *lc;
 		List *indexqual = NIL;
 		Plan *indexplan;
 		foreach (lc, clauses)
@@ -334,8 +322,8 @@ decompress_chunk_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *pat
 			Index compress_relid = dcpath->info->compressed_rel->relid;
 			cxt.compress_relid = compress_relid;
 			cxt.compressed_attnos = dcpath->info->compressed_chunk_compressed_attnos;
-			if (!clause_has_compressed_attrs((Node *) expr, &cxt))
 
+			if (!clause_has_compressed_attrs((Node *) expr, &cxt))
 				indexqual = lappend(indexqual, expr);
 		}
 		indexplan->qual = indexqual;
@@ -346,11 +334,19 @@ decompress_chunk_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *pat
 		 * Code from create_bitmap_scan_plan does something similar, and could be used as a starting
 		 * point.
 		 */
-		cscan->scan.plan.qual = get_actual_clauses(clauses);
+		foreach (lc, clauses)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+			cscan->scan.plan.qual = lappend(cscan->scan.plan.qual, rinfo->clause);
+		}
 	}
 	else
 	{
-		cscan->scan.plan.qual = get_actual_clauses(clauses);
+		foreach (lc, clauses)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+			cscan->scan.plan.qual = lappend(cscan->scan.plan.qual, rinfo->clause);
+		}
 	}
 
 	cscan->scan.plan.qual =

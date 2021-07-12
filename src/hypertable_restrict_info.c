@@ -6,15 +6,10 @@
 #include <postgres.h>
 #include <utils/typcache.h>
 #include <utils/lsyscache.h>
+#include <optimizer/optimizer.h>
 #include <parser/parsetree.h>
 #include <utils/array.h>
-
-#include "compat.h"
-#if PG12_LT
-#include <optimizer/clauses.h>
-#else
-#include <optimizer/optimizer.h>
-#endif
+#include <utils/builtins.h>
 
 #include "hypertable_restrict_info.h"
 #include "dimension.h"
@@ -442,7 +437,9 @@ dimension_values_create_from_array(Const *c, bool user_or)
 	/* it's an array type, lets get the base element type */
 	base_el_type = get_element_type(c->consttype);
 	if (base_el_type == InvalidOid)
-		elog(ERROR, "Couldn't get base element type from array type: %d", c->consttype);
+		elog(ERROR,
+			 "invalid base element type for array type: \"%s\"",
+			 format_type_be(c->consttype));
 
 	return dimension_values_create(values, base_el_type, user_or);
 }
@@ -607,6 +604,9 @@ chunk_cmp_reverse(const void *c1, const void *c2)
 /*
  * get chunk oids ordered by time dimension
  *
+ * if "chunks" is NULL, we get all the chunks from the catalog. Otherwise we
+ * restrict ourselves to the passed in chunks list.
+ *
  * nested_oids is a list of lists, chunks that occupy the same time slice will be
  * in the same list. In the list [[1,2,3],[4,5,6]] chunks 1, 2 and 3 are space partitions of
  * the same time slice and 4, 5 and 6 are space partitions of the next time slice.
@@ -614,15 +614,17 @@ chunk_cmp_reverse(const void *c1, const void *c2)
  */
 List *
 ts_hypertable_restrict_info_get_chunk_oids_ordered(HypertableRestrictInfo *hri, Hypertable *ht,
+												   Chunk **chunks, unsigned int num_chunks,
 												   LOCKMODE lockmode, List **nested_oids,
 												   bool reverse)
 {
-	unsigned num_chunks;
-	Chunk **chunks = hypertable_restrict_info_get_chunks(hri, ht, lockmode, &num_chunks);
 	List *chunk_oids = NIL;
 	List *slot_chunk_oids = NIL;
 	DimensionSlice *slice = NULL;
 	unsigned int i;
+
+	if (chunks == NULL)
+		chunks = hypertable_restrict_info_get_chunks(hri, ht, lockmode, &num_chunks);
 
 	if (num_chunks == 0)
 		return NIL;

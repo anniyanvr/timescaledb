@@ -7,18 +7,11 @@
 #define TIMESCALEDB_TSL_FDW_RELINFO_H
 
 #include <postgres.h>
-#include <nodes/nodes.h>
 #include <foreign/foreign.h>
 #include <lib/stringinfo.h>
-
-#include <compat.h>
-#if PG12_GE
+#include <nodes/nodes.h>
 #include <nodes/pathnodes.h>
 #include <optimizer/optimizer.h>
-#else
-#include <nodes/relation.h>
-#include <optimizer/var.h>
-#endif
 
 #include "remote/connection.h"
 #include "data_node_chunk_assignment.h"
@@ -32,7 +25,8 @@
 
 typedef enum
 {
-	TS_FDW_RELINFO_HYPERTABLE_DATA_NODE = 0,
+	TS_FDW_RELINFO_UNKNOWN = 0,
+	TS_FDW_RELINFO_HYPERTABLE_DATA_NODE,
 	TS_FDW_RELINFO_HYPERTABLE,
 	TS_FDW_RELINFO_FOREIGN_TABLE,
 } TsFdwRelInfoType;

@@ -5,19 +5,12 @@
  */
 #include <postgres.h>
 #include <nodes/nodeFuncs.h>
+#include <optimizer/optimizer.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/paths.h>
 #include <optimizer/tlist.h>
 #include <utils/builtins.h>
 #include <utils/typcache.h>
-
-#include "compat.h"
-#if PG12_LT
-#include <optimizer/clauses.h>
-#include <optimizer/var.h>
-#else
-#include <optimizer/optimizer.h>
-#endif
 
 #include "chunk_append/chunk_append.h"
 #include "chunk_append/planner.h"
@@ -33,6 +26,13 @@ static CustomPathMethods chunk_append_path_methods = {
 	.CustomName = "ChunkAppend",
 	.PlanCustomPath = ts_chunk_append_plan_create,
 };
+
+bool
+ts_is_chunk_append_path(Path *path)
+{
+	return IsA(path, CustomPath) &&
+		   castNode(CustomPath, path)->methods == &chunk_append_path_methods;
+}
 
 static bool
 has_joins(FromExpr *jointree)
@@ -56,6 +56,21 @@ ts_chunk_append_path_create(PlannerInfo *root, RelOptInfo *rel, Hypertable *ht, 
 	path->cpath.path.parent = rel;
 	path->cpath.path.pathtarget = rel->reltarget;
 	path->cpath.path.param_info = subpath->param_info;
+
+	/*
+	 * We keep the pathkeys from the original path here because
+	 * the original path was either a MergeAppendPath and this
+	 * will become an ordered append or the original path is an
+	 * AppendPath and since we do not reorder children the order
+	 * will be kept intact. For the AppendPath case with pathkeys
+	 * it was most likely an Append with only a single child.
+	 * We could skip the ChunkAppend path creation if there is
+	 * only a single child but we decided earlier that ChunkAppend
+	 * would be beneficial for this query so we treat it the same
+	 * as if it had multiple children.
+	 */
+	Assert(IsA(subpath, AppendPath) || IsA(subpath, MergeAppendPath));
+	path->cpath.path.pathkeys = subpath->pathkeys;
 
 	path->cpath.path.parallel_aware = ts_guc_enable_parallel_chunk_append ? parallel_aware : false;
 	path->cpath.path.parallel_safe = subpath->parallel_safe;
@@ -151,7 +166,6 @@ ts_chunk_append_path_create(PlannerInfo *root, RelOptInfo *rel, Hypertable *ht, 
 			path->pushdown_limit = true;
 
 			children = castNode(MergeAppendPath, subpath)->subpaths;
-			path->cpath.path.pathkeys = subpath->pathkeys;
 			break;
 		default:
 			elog(ERROR, "invalid child of chunk append: %u", nodeTag(subpath));
@@ -204,9 +218,7 @@ ts_chunk_append_path_create(PlannerInfo *root, RelOptInfo *rel, Hypertable *ht, 
 				Oid parent_relid = child->parent->relid;
 				bool is_not_pruned =
 					lfirst_oid(lc_oid) == root->simple_rte_array[parent_relid]->relid;
-#if PG12_LT
-				Assert(is_not_pruned);
-#endif
+
 				if (is_not_pruned)
 				{
 					merge_childs = lappend(merge_childs, child);
@@ -231,9 +243,6 @@ ts_chunk_append_path_create(PlannerInfo *root, RelOptInfo *rel, Hypertable *ht, 
 				has_scan_childs = true;
 				nested_children = lappend(nested_children, linitial(merge_childs));
 			}
-#if PG12_LT
-			Assert(list_length(merge_childs) > 0);
-#endif
 		}
 
 		Assert(flat == NULL);

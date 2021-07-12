@@ -222,13 +222,6 @@ compresscolinfo_init(CompressColInfo *cc, Oid srctbl_relid, List *segmentby_cols
 	tupdesc = rel->rd_att;
 	i = 1;
 
-#if PG12_LT
-	if (rel->rd_rel->relhasoids)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("compression cannot be used on table with OIDs")));
-#endif
-
 	foreach (lc, segmentby_cols)
 	{
 		CompressedParsedCol *col = (CompressedParsedCol *) lfirst(lc);
@@ -451,7 +444,7 @@ create_compressed_table_indexes(Oid compresstable_relid, CompressColInfo *compre
 		index_tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(index_addr.objectId));
 
 		if (!HeapTupleIsValid(index_tuple))
-			elog(ERROR, "cache lookup failed for index relid %d", index_addr.objectId);
+			elog(ERROR, "cache lookup failed for index relid %u", index_addr.objectId);
 		index_name = ((Form_pg_class) GETSTRUCT(index_tuple))->relname;
 		elog(DEBUG1,
 			 "adding index %s ON %s.%s USING BTREE(%s, %s)",
@@ -659,8 +652,8 @@ static List *
 add_time_to_order_by_if_not_included(List *orderby_cols, List *segmentby_cols, Hypertable *ht)
 {
 	ListCell *lc;
-	Dimension *time_dim;
-	char *time_col_name;
+	const Dimension *time_dim;
+	const char *time_col_name;
 	bool found = false;
 
 	time_dim = hyperspace_get_open_dimension(ht->space, 0);
@@ -762,14 +755,10 @@ validate_existing_constraints(Hypertable *ht, CompressColInfo *colinfo)
 										&is_null);
 			if (is_null)
 			{
-#if PG12_LT
-				Oid oid = HeapTupleGetOid(tuple);
-#else
 				Oid oid = heap_getattr(tuple,
 									   Anum_pg_constraint_oid,
 									   RelationGetDescr(pg_constr),
 									   &is_null);
-#endif
 				elog(ERROR, "null conkey for constraint %u", oid);
 			}
 
@@ -813,7 +802,7 @@ validate_existing_constraints(Hypertable *ht, CompressColInfo *colinfo)
 			if (form->contype == CONSTRAINT_FOREIGN)
 			{
 				Name conname = palloc0(NAMEDATALEN);
-				namecpy(conname, &form->conname);
+				namestrcpy(conname, NameStr(form->conname));
 				conlist = lappend(conlist, conname);
 			}
 		}

@@ -24,6 +24,7 @@
 CROSSMODULE_WRAPPER(policy_compression_add);
 CROSSMODULE_WRAPPER(policy_compression_proc);
 CROSSMODULE_WRAPPER(policy_compression_remove);
+CROSSMODULE_WRAPPER(policy_recompression_proc);
 CROSSMODULE_WRAPPER(policy_refresh_cagg_add);
 CROSSMODULE_WRAPPER(policy_refresh_cagg_proc);
 CROSSMODULE_WRAPPER(policy_refresh_cagg_remove);
@@ -64,6 +65,7 @@ CROSSMODULE_WRAPPER(array_compressor_append);
 CROSSMODULE_WRAPPER(array_compressor_finish);
 CROSSMODULE_WRAPPER(compress_chunk);
 CROSSMODULE_WRAPPER(decompress_chunk);
+CROSSMODULE_WRAPPER(recompress_chunk);
 
 /* continous aggregate */
 CROSSMODULE_WRAPPER(continuous_agg_invalidation_trigger);
@@ -222,13 +224,13 @@ empty_fn(PG_FUNCTION_ARGS)
 }
 
 static void
-create_chunk_on_data_nodes_default(Chunk *chunk, Hypertable *ht)
+create_chunk_on_data_nodes_default(const Chunk *chunk, const Hypertable *ht)
 {
 	error_no_default_fn_community();
 }
 
 static Path *
-data_node_dispatch_path_create_default(PlannerInfo *root, ModifyTablePath *mtpath,
+distributed_insert_path_create_default(PlannerInfo *root, ModifyTablePath *mtpath,
 									   Index hypertable_rti, int subpath_index)
 {
 	error_no_default_fn_community();
@@ -308,6 +310,7 @@ TSDLLEXPORT CrossModuleFunctions ts_cm_functions_default = {
 	.policy_compression_add = error_no_default_fn_pg_community,
 	.policy_compression_proc = error_no_default_fn_pg_community,
 	.policy_compression_remove = error_no_default_fn_pg_community,
+	.policy_recompression_proc = error_no_default_fn_pg_community,
 	.policy_refresh_cagg_add = error_no_default_fn_pg_community,
 	.policy_refresh_cagg_proc = error_no_default_fn_pg_community,
 	.policy_refresh_cagg_remove = error_no_default_fn_pg_community,
@@ -345,6 +348,7 @@ TSDLLEXPORT CrossModuleFunctions ts_cm_functions_default = {
 	.process_compress_table = process_compress_table_default,
 	.compress_chunk = error_no_default_fn_pg_community,
 	.decompress_chunk = error_no_default_fn_pg_community,
+	.recompress_chunk = error_no_default_fn_pg_community,
 	.compressed_data_decompress_forward = error_no_default_fn_pg_community,
 	.compressed_data_decompress_reverse = error_no_default_fn_pg_community,
 	.deltadelta_compressor_append = error_no_default_fn_pg_community,
@@ -355,7 +359,10 @@ TSDLLEXPORT CrossModuleFunctions ts_cm_functions_default = {
 	.dictionary_compressor_finish = error_no_default_fn_pg_community,
 	.array_compressor_append = error_no_default_fn_pg_community,
 	.array_compressor_finish = error_no_default_fn_pg_community,
-
+	.compress_row_init = NULL,
+	.compress_row_exec = NULL,
+	.compress_row_end = NULL,
+	.compress_row_destroy = NULL,
 	.data_node_add = error_no_default_fn_pg_community,
 	.data_node_delete = error_no_default_fn_pg_community,
 	.data_node_attach = error_no_default_fn_pg_community,
@@ -378,7 +385,7 @@ TSDLLEXPORT CrossModuleFunctions ts_cm_functions_default = {
 	.remote_txn_id_out = error_no_default_fn_pg_community,
 	.remote_txn_heal_data_node = error_no_default_fn_pg_community,
 	.remote_connection_cache_show = error_no_default_fn_pg_community,
-	.data_node_dispatch_path_create = data_node_dispatch_path_create_default,
+	.distributed_insert_path_create = distributed_insert_path_create_default,
 	.distributed_copy = distributed_copy_default,
 	.set_distributed_id = set_distributed_id_default,
 	.set_distributed_peer_id = set_distributed_peer_id_default,

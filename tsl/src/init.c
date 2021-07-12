@@ -28,7 +28,7 @@
 #include "continuous_aggs/refresh.h"
 #include "continuous_aggs/invalidation.h"
 #include "cross_module_fn.h"
-#include "data_node_dispatch.h"
+#include "nodes/data_node_dispatch.h"
 #include "data_node.h"
 #include "dist_util.h"
 #include "export.h"
@@ -36,6 +36,7 @@
 #include "hypertable.h"
 #include "license_guc.h"
 #include "nodes/decompress_chunk/planner.h"
+#include "nodes/skip_scan/skip_scan.h"
 #include "nodes/gapfill/gapfill.h"
 #include "partialize_finalize.h"
 #include "planner.h"
@@ -90,6 +91,7 @@ CrossModuleFunctions tsl_cm_functions = {
 	.policy_compression_add = policy_compression_add,
 	.policy_compression_proc = policy_compression_proc,
 	.policy_compression_remove = policy_compression_remove,
+	.policy_recompression_proc = policy_recompression_proc,
 	.policy_refresh_cagg_add = policy_refresh_cagg_add,
 	.policy_refresh_cagg_proc = policy_refresh_cagg_proc,
 	.policy_refresh_cagg_remove = policy_refresh_cagg_remove,
@@ -145,6 +147,11 @@ CrossModuleFunctions tsl_cm_functions = {
 	.process_rename_cmd = tsl_process_rename_cmd,
 	.compress_chunk = tsl_compress_chunk,
 	.decompress_chunk = tsl_decompress_chunk,
+	.recompress_chunk = tsl_recompress_chunk,
+	.compress_row_init = compress_row_init,
+	.compress_row_exec = compress_row_exec,
+	.compress_row_end = compress_row_end,
+	.compress_row_destroy = compress_row_destroy,
 	.data_node_add = data_node_add,
 	.data_node_delete = data_node_delete,
 	.data_node_attach = data_node_attach,
@@ -165,7 +172,7 @@ CrossModuleFunctions tsl_cm_functions = {
 	.remote_txn_heal_data_node = remote_txn_heal_data_node,
 	.remote_connection_cache_show = remote_connection_cache_show,
 	.set_rel_pathlist = tsl_set_rel_pathlist,
-	.data_node_dispatch_path_create = data_node_dispatch_path_create,
+	.distributed_insert_path_create = tsl_create_distributed_insert_path,
 	.distributed_copy = remote_distributed_copy,
 	.ddl_command_start = tsl_ddl_command_start,
 	.ddl_command_end = tsl_ddl_command_end,
@@ -200,6 +207,7 @@ ts_module_init(PG_FUNCTION_ARGS)
 
 	_continuous_aggs_cache_inval_init();
 	_decompress_chunk_init();
+	_skip_scan_init();
 	_remote_connection_cache_init();
 	_remote_dist_txn_init();
 	_tsl_process_utility_init();

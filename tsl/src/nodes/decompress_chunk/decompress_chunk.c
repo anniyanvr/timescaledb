@@ -11,22 +11,13 @@
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
 #include <optimizer/cost.h>
+#include <optimizer/optimizer.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/paths.h>
 #include <parser/parsetree.h>
 #include <utils/builtins.h>
 #include <utils/lsyscache.h>
 #include <utils/typcache.h>
-
-#include "compat.h"
-#if PG12_LT
-#include <optimizer/clauses.h>
-#include <optimizer/restrictinfo.h>
-#include <optimizer/tlist.h>
-#include <optimizer/var.h>
-#else
-#include <optimizer/optimizer.h>
-#endif
 
 #include "hypertable_compression.h"
 #include "import/planner.h"
@@ -64,7 +55,8 @@ static DecompressChunkPath *decompress_chunk_path_create(PlannerInfo *root, Comp
 static void decompress_chunk_add_plannerinfo(PlannerInfo *root, CompressionInfo *info, Chunk *chunk,
 											 RelOptInfo *chunk_rel, bool needs_sequence_num);
 
-static SortInfo build_sortinfo(RelOptInfo *chunk_rel, CompressionInfo *info, List *pathkeys);
+static SortInfo build_sortinfo(Chunk *chunk, RelOptInfo *chunk_rel, CompressionInfo *info,
+							   List *pathkeys);
 
 /*
  * Like ts_make_pathkey_from_sortop but passes down the compressed relid so that existing
@@ -347,7 +339,7 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 	 */
 	int parallel_workers = 1;
 	AppendRelInfo *chunk_info = ts_get_appendrelinfo(root, chunk_rel->relid, false);
-	SortInfo sort_info = build_sortinfo(chunk_rel, info, root->query_pathkeys);
+	SortInfo sort_info = build_sortinfo(chunk, chunk_rel, info, root->query_pathkeys);
 
 	Assert(chunk_info != NULL);
 	Assert(chunk_info->parent_reloid == ht->main_table_relid);
@@ -377,6 +369,8 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 								 info,
 								 &sort_info);
 
+	/* compute parent relids of the chunk and use it to filter paths*/
+	Relids parent_relids = find_childrel_parents(root, chunk_rel);
 	/* create non-parallel paths */
 	foreach (lc, compressed_rel->pathlist)
 	{
@@ -387,11 +381,26 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 		 * Filter out all paths that try to JOIN the compressed chunk on the
 		 * hypertable or the uncompressed chunk
 		 * Ideally, we wouldn't create these paths in the first place.
+		 * However, create_join_clause code is called by PG while generating paths for the
+		 * compressed_rel via generate_implied_equalities_for_column.
+		 * create_join_clause ends up creating rinfo's between compressed_rel and ht because
+		 * PG does not know that compressed_rel is related to ht in anyway.
+		 * The parent-child relationship between chunk_rel and ht is known
+		 * to PG and so it does not try to create meaningless rinfos for that case.
 		 */
-		if (child_path->param_info != NULL &&
-			(bms_is_member(chunk_rel->relid, child_path->param_info->ppi_req_outer) ||
-			 bms_is_member(ht_index, child_path->param_info->ppi_req_outer)))
-			continue;
+		if (child_path->param_info != NULL)
+		{
+			if (bms_is_member(chunk_rel->relid, child_path->param_info->ppi_req_outer))
+				continue;
+			/* check if this is path made with references between
+			 * compressed_rel + hypertable or a nesting subquery.
+			 * The latter can happen in the case of UNION queries. see github 2917. This
+			 * happens since PG is not aware that the nesting
+			 * subquery that references the hypertable is a parent of compressed_rel as well.
+			 */
+			if (bms_overlap(parent_relids, child_path->param_info->ppi_req_outer))
+				continue;
+		}
 
 		path = decompress_chunk_path_create(root, info, 0, child_path);
 
@@ -911,6 +920,11 @@ decompress_chunk_add_plannerinfo(PlannerInfo *root, CompressionInfo *info, Chunk
 	Oid compressed_relid = compressed_chunk->table_id;
 	RelOptInfo *compressed_rel;
 
+	/* repalloc() does not work with NULL argument */
+	Assert(root->simple_rel_array);
+	Assert(root->simple_rte_array);
+	Assert(root->append_rel_array);
+
 	root->simple_rel_array_size++;
 	root->simple_rel_array =
 		repalloc(root->simple_rel_array, root->simple_rel_array_size * sizeof(RelOptInfo *));
@@ -1054,9 +1068,7 @@ decompress_chunk_make_rte(Oid compressed_relid, LOCKMODE lockmode)
 	rte->rtekind = RTE_RELATION;
 	rte->relid = compressed_relid;
 	rte->relkind = r->rd_rel->relkind;
-#if PG12_GE
 	rte->rellockmode = lockmode;
-#endif
 	rte->eref = makeAlias(RelationGetRelationName(r), NULL);
 
 	/*
@@ -1209,7 +1221,7 @@ find_restrictinfo_equality(RelOptInfo *chunk_rel, CompressionInfo *info)
  * If query pathkeys is shorter than segmentby + compress_orderby pushdown can still be done
  */
 static SortInfo
-build_sortinfo(RelOptInfo *chunk_rel, CompressionInfo *info, List *pathkeys)
+build_sortinfo(Chunk *chunk, RelOptInfo *chunk_rel, CompressionInfo *info, List *pathkeys)
 {
 	int pk_index;
 	PathKey *pk;
@@ -1220,7 +1232,7 @@ build_sortinfo(RelOptInfo *chunk_rel, CompressionInfo *info, List *pathkeys)
 	ListCell *lc = list_head(pathkeys);
 	SortInfo sort_info = { .can_pushdown_sort = false, .needs_sequence_num = false };
 
-	if (pathkeys == NIL)
+	if (pathkeys == NIL || ts_chunk_is_unordered(chunk))
 		return sort_info;
 
 	/* all segmentby columns need to be prefix of pathkeys */

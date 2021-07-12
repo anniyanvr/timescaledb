@@ -37,6 +37,7 @@
 #include <nodes/parsenodes.h>
 #include <nodes/pg_list.h>
 #include <optimizer/clauses.h>
+#include <optimizer/optimizer.h>
 #include <optimizer/tlist.h>
 #include <parser/analyze.h>
 #include <parser/parse_func.h>
@@ -48,17 +49,10 @@
 #include <utils/builtins.h>
 #include <utils/catcache.h>
 #include <utils/int8.h>
+#include <utils/regproc.h>
 #include <utils/ruleutils.h>
 #include <utils/syscache.h>
 #include <utils/typcache.h>
-
-#include "compat.h"
-#if PG12_LT
-#include <optimizer/clauses.h>
-#include <optimizer/tlist.h>
-#else
-#include <optimizer/optimizer.h>
-#endif
 
 #include "create.h"
 
@@ -70,7 +64,6 @@
 #include "hypertable_cache.h"
 #include "hypertable.h"
 #include "invalidation.h"
-#include "continuous_aggs/job.h"
 #include "dimension.h"
 #include "continuous_agg.h"
 #include "options.h"
@@ -200,15 +193,10 @@ static Var *mattablecolumninfo_addentry(MatTableColumnInfo *out, Node *input,
 										int original_query_resno);
 static void mattablecolumninfo_addinternal(MatTableColumnInfo *matcolinfo,
 										   RangeTblEntry *usertbl_rte, int32 usertbl_htid);
-static int32 mattablecolumninfo_create_materialization_table(MatTableColumnInfo *matcolinfo,
-															 int32 hypertable_id, RangeVar *mat_rel,
-															 CAggTimebucketInfo *origquery_tblinfo,
-															 bool create_addl_index,
-															 char *tablespacename,
-#if PG12_GE
-															 char *table_access_method,
-#endif
-															 ObjectAddress *mataddress);
+static int32 mattablecolumninfo_create_materialization_table(
+	MatTableColumnInfo *matcolinfo, int32 hypertable_id, RangeVar *mat_rel,
+	CAggTimebucketInfo *origquery_tblinfo, bool create_addl_index, char *tablespacename,
+	char *table_access_method, ObjectAddress *mataddress);
 static Query *mattablecolumninfo_get_partial_select_query(MatTableColumnInfo *matcolinfo,
 														  Query *userview_query);
 
@@ -428,7 +416,7 @@ mattablecolumninfo_add_mattable_index(MatTableColumnInfo *matcolinfo, Hypertable
 		indxtuple = SearchSysCache1(RELOID, ObjectIdGetDatum(indxaddr.objectId));
 
 		if (!HeapTupleIsValid(indxtuple))
-			elog(ERROR, "cache lookup failed for index relid %d", indxaddr.objectId);
+			elog(ERROR, "cache lookup failed for index relid %u", indxaddr.objectId);
 		indxname = ((Form_pg_class) GETSTRUCT(indxtuple))->relname;
 		elog(DEBUG1,
 			 "adding index %s ON %s.%s USING BTREE(%s, %s)",
@@ -463,9 +451,7 @@ mattablecolumninfo_create_materialization_table(MatTableColumnInfo *matcolinfo, 
 												RangeVar *mat_rel,
 												CAggTimebucketInfo *origquery_tblinfo,
 												bool create_addl_index, char *const tablespacename,
-#if PG12_GE
 												char *const table_access_method,
-#endif
 												ObjectAddress *mataddress)
 {
 	Oid uid, saved_uid;
@@ -490,9 +476,7 @@ mattablecolumninfo_create_materialization_table(MatTableColumnInfo *matcolinfo, 
 	create->options = NULL;
 	create->oncommit = ONCOMMIT_NOOP;
 	create->tablespacename = tablespacename;
-#if PG12_GE
 	create->accessMethod = table_access_method;
-#endif
 	create->if_not_exists = false;
 
 	/*  Create the materialization table.  */
@@ -778,7 +762,7 @@ cagg_validate_query(Query *query)
 	}
 	if (rte->relkind == RELKIND_RELATION)
 	{
-		Dimension *part_dimension = NULL;
+		const Dimension *part_dimension = NULL;
 
 		ht = ts_hypertable_cache_get_cache_and_entry(rte->relid, CACHE_FLAG_NONE, &hcache);
 
@@ -906,7 +890,7 @@ get_input_types_array_datum(Aggref *original_aggregate)
 			elog(ERROR, "cache lookup failed for type %u", type_oid);
 
 		typtup = (Form_pg_type) GETSTRUCT(tp);
-		namecpy(type_name, &typtup->typname);
+		namestrcpy(type_name, NameStr(typtup->typname));
 		schema_name = get_namespace_name(typtup->typnamespace);
 		ReleaseSysCache(tp);
 
@@ -979,7 +963,7 @@ get_finalize_aggref(Aggref *inp, Var *partial_state_var)
 	aggref->aggsplit = AGGSPLIT_SIMPLE;
 	aggref->location = -1;
 	/* construct the arguments */
-	agggregate_signature = DatumGetCString(DirectFunctionCall1(regprocedureout, inp->aggfnoid));
+	agggregate_signature = format_procedure_qualified(inp->aggfnoid);
 	aggregate_signature_const = makeConst(TEXTOID,
 										  -1,
 										  DEFAULT_COLLATION_OID,
@@ -1085,9 +1069,18 @@ get_partialize_funcexpr(Aggref *agg)
 static bool
 is_valid_bucketing_function(Oid funcid)
 {
+	bool is_timescale;
 	FuncInfo *finfo = ts_func_cache_get_bucketing_func(funcid);
 
-	return finfo != NULL && finfo->is_timescaledb_func && finfo->nargs == 2;
+	if (finfo == NULL)
+	{
+		return false;
+	}
+
+	is_timescale =
+		(finfo->origin == ORIGIN_TIMESCALE) || (finfo->origin == ORIGIN_TIMESCALE_EXPERIMENTAL);
+
+	return is_timescale && (finfo->nargs == 2);
 }
 
 /*initialize MatTableColumnInfo */
@@ -1685,9 +1678,7 @@ cagg_create(const CreateTableAsStmt *create_stmt, ViewStmt *stmt, Query *panquer
 													origquery_ht,
 													is_create_mattbl_index,
 													create_stmt->into->tableSpaceName,
-#if PG12_GE
 													create_stmt->into->accessMethod,
-#endif
 													&mataddress);
 	/* Step 2: create view with select finalize from materialization
 	 * table

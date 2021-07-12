@@ -6,21 +6,12 @@
 #include <postgres.h>
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
+#include <optimizer/optimizer.h>
 #include <optimizer/restrictinfo.h>
 #include <parser/parsetree.h>
 #include <parser/parse_func.h>
 #include <utils/builtins.h>
 #include <utils/typcache.h>
-
-#include "compat.h"
-#if PG12_LT
-#include <optimizer/clauses.h>
-#include <optimizer/pathnode.h>
-#include <optimizer/tlist.h>
-#include <optimizer/var.h>
-#else
-#include <optimizer/optimizer.h>
-#endif
 
 #include "decompress_chunk.h"
 #include "qual_pushdown.h"
@@ -82,12 +73,13 @@ pushdown_quals(PlannerInfo *root, RelOptInfo *chunk_rel, RelOptInfo *compressed_
 				{
 					compressed_rel->baserestrictinfo =
 						lappend(compressed_rel->baserestrictinfo,
-								make_simple_restrictinfo(lfirst(lc_and)));
+								make_simple_restrictinfo_compat(root, lfirst(lc_and)));
 				}
 			}
 			else
 				compressed_rel->baserestrictinfo =
-					lappend(compressed_rel->baserestrictinfo, make_simple_restrictinfo(expr));
+					lappend(compressed_rel->baserestrictinfo,
+							make_simple_restrictinfo_compat(root, expr));
 		}
 		/* We need to check the restriction clause on the decompress node if the clause can't be
 		 * pushed down or needs re-checking */
@@ -365,6 +357,7 @@ modify_expression(Node *node, QualPushdownContext *context)
 			/* opexpr will still be checked for segment by columns */
 			break;
 		}
+		case T_RelabelType:
 		case T_ScalarArrayOpExpr:
 		case T_List:
 		case T_Const:

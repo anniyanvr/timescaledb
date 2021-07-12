@@ -81,10 +81,15 @@ apply_fdw_and_server_options(TsFdwRelInfo *fpinfo)
 TsFdwRelInfo *
 fdw_relinfo_get(RelOptInfo *rel)
 {
-	TimescaleDBPrivate *rel_private = rel->fdw_private;
+	TimescaleDBPrivate *rel_private;
 
-	Assert(rel_private != NULL);
-	Assert(rel_private->fdw_relation_info != NULL);
+	if (!rel->fdw_private)
+		ts_create_private_reloptinfo(rel);
+
+	rel_private = rel->fdw_private;
+
+	if (!rel_private->fdw_relation_info)
+		rel_private->fdw_relation_info = palloc0(sizeof(TsFdwRelInfo));
 
 	return (TsFdwRelInfo *) rel_private->fdw_relation_info;
 }
@@ -96,7 +101,7 @@ fdw_relinfo_alloc(RelOptInfo *rel, TsFdwRelInfoType reltype)
 	TsFdwRelInfo *fpinfo;
 
 	if (NULL == rel->fdw_private)
-		rel->fdw_private = palloc0(sizeof(*rel_private));
+		ts_create_private_reloptinfo(rel);
 
 	rel_private = rel->fdw_private;
 
@@ -121,8 +126,8 @@ get_relation_qualified_name(Oid relid)
 static const double FILL_FACTOR_CURRENT_CHUNK = 0.5;
 static const double FILL_FACTOR_HISTORICAL_CHUNK = 1;
 
-static DimensionSlice *
-get_chunk_time_slice(Chunk *chunk, Hyperspace *space)
+static const DimensionSlice *
+get_chunk_time_slice(const Chunk *chunk, const Hyperspace *space)
 {
 	int32 time_dim_id = hyperspace_get_open_dimension(space, 0)->fd.id;
 	return ts_hypercube_get_slice_by_dimension_id(chunk->cube, time_dim_id);
@@ -173,8 +178,8 @@ get_total_number_of_slices(Hyperspace *space)
 static double
 estimate_chunk_fillfactor(Chunk *chunk, Hyperspace *space)
 {
-	Dimension *time_dim = hyperspace_get_open_dimension(space, 0);
-	DimensionSlice *time_slice = get_chunk_time_slice(chunk, space);
+	const Dimension *time_dim = hyperspace_get_open_dimension(space, 0);
+	const DimensionSlice *time_slice = get_chunk_time_slice(chunk, space);
 	Oid time_dim_type = ts_dimension_get_partition_type(time_dim);
 	int num_created_after = ts_chunk_num_of_chunks_created_after(chunk);
 	int total_slices = get_total_number_of_slices(space);
@@ -243,7 +248,7 @@ estimate_tuples_and_pages_using_prev_chunks(PlannerInfo *root, Hyperspace *space
 	int32 total_pages = 0;
 	int non_zero_reltuples_cnt = 0;
 	int non_zero_relpages_cnt = 0;
-	DimensionSlice *time_slice = get_chunk_time_slice(current_chunk, space);
+	const DimensionSlice *time_slice = get_chunk_time_slice(current_chunk, space);
 	List *prev_chunks = ts_chunk_get_window(time_slice->fd.dimension_id,
 											time_slice->fd.range_start,
 											DEFAULT_CHUNK_LOOKBACK_WINDOW,
@@ -336,7 +341,7 @@ estimate_tuples_and_pages(PlannerInfo *root, RelOptInfo *rel)
 	Hyperspace *hyperspace;
 	RelEstimates *estimates;
 
-	Assert(rel->tuples == 0);
+	Assert(rel->tuples <= 0);
 	Assert(rel->pages == 0);
 
 	/* In some cases (e.g., UPDATE stmt) top_parent_relids is not set so the best
@@ -361,7 +366,7 @@ estimate_tuples_and_pages(PlannerInfo *root, RelOptInfo *rel)
 	/* Let's first try figuring out number of tuples/pages using stats from previous chunks,
 	otherwise make an estimation based on shared buffers size */
 	estimates = estimate_tuples_and_pages_using_prev_chunks(root, hyperspace, chunk);
-	if (estimates->tuples == 0 || estimates->pages == 0)
+	if (estimates->tuples <= 0 || estimates->pages == 0)
 		estimates = estimate_tuples_and_pages_using_shared_buffers(root, ht, rel->reltarget->width);
 
 	chunk_fillfactor = estimate_chunk_fillfactor(chunk, hyperspace);
@@ -473,9 +478,10 @@ fdw_relinfo_create(PlannerInfo *root, RelOptInfo *rel, Oid server_oid, Oid local
 	/*
 	 * If the foreign table has never been ANALYZEd, it will have relpages
 	 * and reltuples equal to zero, which most likely has nothing to do
-	 * with reality. The best we can do is estimate number of tuples/pages.
+	 * with reality. Starting with PG14 it will have reltuples < 0, meaning
+	 * "unknown". The best we can do is estimate number of tuples/pages.
 	 */
-	if (rel->pages == 0 && rel->tuples == 0 && type == TS_FDW_RELINFO_FOREIGN_TABLE)
+	if (rel->pages == 0 && rel->tuples <= 0 && type == TS_FDW_RELINFO_FOREIGN_TABLE)
 		estimate_tuples_and_pages(root, rel);
 
 	/* Estimate rel size as best we can with local statistics. There are

@@ -77,7 +77,6 @@ SELECT * FROM _timescaledb_catalog.chunk_constraint;
 INSERT INTO _timescaledb_catalog.metadata VALUES ('exported_uuid', 'original_uuid', true);
 
 \c postgres :ROLE_SUPERUSER
-
 -- We shell out to a script in order to grab the correct hostname from the
 -- environmental variables that originally called this psql command. Sadly
 -- vars passed to psql do not work in \! commands so we can't do it that way.
@@ -88,6 +87,8 @@ SET client_min_messages = ERROR;
 CREATE EXTENSION timescaledb CASCADE;
 --create a exported uuid before restoring (mocks telemetry running before restore)
 INSERT INTO _timescaledb_catalog.metadata VALUES ('exported_uuid', 'new_db_uuid', true);
+-- disable background jobs
+UPDATE _timescaledb_config.bgw_job SET scheduled = false;
 RESET client_min_messages;
 SELECT timescaledb_pre_restore();
 SHOW timescaledb.restoring;
@@ -106,6 +107,9 @@ VALUES (1357894000000000000, 'dev5', 1.5, 2);
 -- Now run our post-restore function.
 SELECT timescaledb_post_restore();
 SHOW timescaledb.restoring;
+-- timescaledb_post_restore restarts background worker so we have to stop them
+-- to make sure they dont interfere with this database being used as template below
+SELECT _timescaledb_internal.stop_background_workers();
 
 --should be same as count above
 SELECT count(*) = :num_dependent_objects as dependent_objects_match
@@ -177,11 +181,15 @@ SELECT get_sqlstate('SELECT timescaledb_post_restore()');
 
 drop function get_sqlstate(TEXT);
 
---use a standard dbname because :TEST_DBNAME is different on 9.6 vs 10 & 11
---and dbname is displayed in error
-\c :TEST_DBNAME :ROLE_SUPERUSER
+\c postgres :ROLE_SUPERUSER
 --need to shutdown workers to use db as template
-SELECT _timescaledb_internal.stop_background_workers();
+--<exclude_from_test>
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = :'TEST_DBNAME';
+--</exclude_from_test>
+-- there should be no sessions for that database
+-- columns are explicit so the output is the same on PG12 and PG13 since PG13 has extra column leader_pid
+SELECT datid,datname,pid,usesysid,usename,application_name,client_addr,client_hostname,client_port,backend_start,xact_start,query_start,state_change,wait_event_type,wait_event,state,backend_xid,backend_xmin,query,backend_type FROM pg_stat_activity WHERE datname = :'TEST_DBNAME';
+
 CREATE DATABASE db_dump_error WITH TEMPLATE :TEST_DBNAME;
 
 --now test functions for permission errors

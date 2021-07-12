@@ -122,10 +122,9 @@ Datum
 policy_reorder_add(PG_FUNCTION_ARGS)
 {
 	NameData application_name;
-	NameData reorder_name;
 	NameData proc_name, proc_schema, owner;
 	int32 job_id;
-	Dimension *dim;
+	const Dimension *dim;
 	Interval schedule_interval = DEFAULT_SCHEDULE_INTERVAL;
 	Oid ht_oid = PG_GETARG_OID(0);
 	Name index_name = PG_GETARG_NAME(1);
@@ -162,6 +161,21 @@ policy_reorder_add(PG_FUNCTION_ARGS)
 													 INTERNAL_SCHEMA_NAME,
 													 ht->fd.id);
 
+	/*
+	 * Try to see if the hypertable has a specified chunk length for the
+	 * default schedule interval
+	 */
+	dim = hyperspace_get_open_dimension(ht->space, 0);
+	Assert(dim);
+
+	partitioning_type = ts_dimension_get_partition_type(dim);
+	if (IS_TIMESTAMP_TYPE(partitioning_type))
+	{
+		schedule_interval.time = dim->fd.interval_length / 2;
+		schedule_interval.day = 0;
+		schedule_interval.month = 0;
+	}
+
 	ts_cache_release(hcache);
 
 	if (jobs != NIL)
@@ -197,35 +211,19 @@ policy_reorder_add(PG_FUNCTION_ARGS)
 
 	/* Next, insert a new job into jobs table */
 	namestrcpy(&application_name, "Reorder Policy");
-	namestrcpy(&reorder_name, "reorder");
 	namestrcpy(&proc_name, POLICY_REORDER_PROC_NAME);
 	namestrcpy(&proc_schema, INTERNAL_SCHEMA_NAME);
 	namestrcpy(&owner, GetUserNameFromId(owner_id, false));
 
-	/*
-	 * Try to see if the hypertable has a specified chunk length for the
-	 * default schedule interval
-	 */
-	dim = hyperspace_get_open_dimension(ht->space, 0);
-
-	partitioning_type = ts_dimension_get_partition_type(dim);
-	if (dim && IS_TIMESTAMP_TYPE(partitioning_type))
-	{
-		schedule_interval.time = dim->fd.interval_length / 2;
-		schedule_interval.day = 0;
-		schedule_interval.month = 0;
-	}
-
 	JsonbParseState *parse_state = NULL;
 
 	pushJsonbValue(&parse_state, WJB_BEGIN_OBJECT, NULL);
-	ts_jsonb_add_int32(parse_state, CONFIG_KEY_HYPERTABLE_ID, ht->fd.id);
+	ts_jsonb_add_int32(parse_state, CONFIG_KEY_HYPERTABLE_ID, hypertable_id);
 	ts_jsonb_add_str(parse_state, CONFIG_KEY_INDEX_NAME, NameStr(*index_name));
 	JsonbValue *result = pushJsonbValue(&parse_state, WJB_END_OBJECT, NULL);
 	Jsonb *config = JsonbValueToJsonb(result);
 
 	job_id = ts_bgw_job_insert_relation(&application_name,
-										&reorder_name,
 										&schedule_interval,
 										DEFAULT_MAX_RUNTIME,
 										DEFAULT_MAX_RETRIES,

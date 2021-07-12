@@ -59,8 +59,8 @@ cmp_dimension_id(const void *left, const void *right)
 	return 0;
 }
 
-Dimension *
-ts_hyperspace_get_dimension_by_id(Hyperspace *hs, int32 id)
+const Dimension *
+ts_hyperspace_get_dimension_by_id(const Hyperspace *hs, int32 id)
 {
 	Dimension dim = {
 		.fd.id = id,
@@ -70,7 +70,7 @@ ts_hyperspace_get_dimension_by_id(Hyperspace *hs, int32 id)
 }
 
 Dimension *
-ts_hyperspace_get_dimension_by_name(Hyperspace *hs, DimensionType type, const char *name)
+ts_hyperspace_get_mutable_dimension_by_name(Hyperspace *hs, DimensionType type, const char *name)
 {
 	int i;
 
@@ -86,8 +86,14 @@ ts_hyperspace_get_dimension_by_name(Hyperspace *hs, DimensionType type, const ch
 	return NULL;
 }
 
+const Dimension *
+ts_hyperspace_get_dimension_by_name(const Hyperspace *hs, DimensionType type, const char *name)
+{
+	return ts_hyperspace_get_mutable_dimension_by_name((Hyperspace *) hs, type, name);
+}
+
 Dimension *
-ts_hyperspace_get_dimension(Hyperspace *hs, DimensionType type, Index n)
+ts_hyperspace_get_mutable_dimension(Hyperspace *hs, DimensionType type, Index n)
 {
 	int i;
 
@@ -102,6 +108,12 @@ ts_hyperspace_get_dimension(Hyperspace *hs, DimensionType type, Index n)
 	}
 
 	return NULL;
+}
+
+const Dimension *
+ts_hyperspace_get_dimension(const Hyperspace *hs, DimensionType type, Index n)
+{
+	return ts_hyperspace_get_mutable_dimension((Hyperspace *) hs, type, n);
 }
 
 static int
@@ -188,11 +200,12 @@ dimension_fill_in_from_tuple(Dimension *d, TupleInfo *ti, Oid main_table_relid)
 	if (!isnull[Anum_dimension_integer_now_func_schema - 1] &&
 		!isnull[Anum_dimension_integer_now_func - 1])
 	{
-		namecpy(&d->fd.integer_now_func_schema,
-				DatumGetName(
-					values[AttrNumberGetAttrOffset(Anum_dimension_integer_now_func_schema)]));
-		namecpy(&d->fd.integer_now_func,
-				DatumGetName(values[AttrNumberGetAttrOffset(Anum_dimension_integer_now_func)]));
+		namestrcpy(&d->fd.integer_now_func_schema,
+				   DatumGetCString(
+					   values[AttrNumberGetAttrOffset(Anum_dimension_integer_now_func_schema)]));
+		namestrcpy(&d->fd.integer_now_func,
+				   DatumGetCString(
+					   values[AttrNumberGetAttrOffset(Anum_dimension_integer_now_func)]));
 	}
 
 	if (d->type == DIMENSION_TYPE_CLOSED)
@@ -283,7 +296,7 @@ ts_dimension_calculate_open_range_default(PG_FUNCTION_ARGS)
 }
 
 static int64
-calculate_closed_range_interval(Dimension *dim)
+calculate_closed_range_interval(const Dimension *dim)
 {
 	Assert(NULL != dim && IS_CLOSED_DIMENSION(dim));
 
@@ -291,7 +304,7 @@ calculate_closed_range_interval(Dimension *dim)
 }
 
 static DimensionSlice *
-calculate_closed_range_default(Dimension *dim, int64 value)
+calculate_closed_range_default(const Dimension *dim, int64 value)
 {
 	int64 range_start, range_end;
 
@@ -342,7 +355,7 @@ ts_dimension_calculate_closed_range_default(PG_FUNCTION_ARGS)
 }
 
 DimensionSlice *
-ts_dimension_calculate_default_slice(Dimension *dim, int64 value)
+ts_dimension_calculate_default_slice(const Dimension *dim, int64 value)
 {
 	if (IS_OPEN_DIMENSION(dim))
 		return calculate_open_range_default(dim, value);
@@ -366,7 +379,7 @@ ts_dimension_calculate_default_slice(Dimension *dim, int64 value)
  * ' | A | B | C | D | E |
  */
 static int
-ts_dimension_get_open_slice_ordinal(Dimension *dim, DimensionSlice *slice)
+ts_dimension_get_open_slice_ordinal(const Dimension *dim, const DimensionSlice *slice)
 {
 	DimensionVec *vec;
 	int i;
@@ -401,7 +414,7 @@ ts_dimension_get_open_slice_ordinal(Dimension *dim, DimensionSlice *slice)
  * the ordinal of current slice most overlapping the given slice (or first fully overlapped slice).
  */
 static int
-ts_dimension_get_closed_slice_ordinal(Dimension *dim, DimensionSlice *target_slice)
+ts_dimension_get_closed_slice_ordinal(const Dimension *dim, const DimensionSlice *target_slice)
 {
 	int64 current_slice_size;
 	int64 target_slice_size;
@@ -449,7 +462,7 @@ ts_dimension_get_closed_slice_ordinal(Dimension *dim, DimensionSlice *target_sli
  * dimensional axis gets the lowest ordinal value and the "latest" the largest.
  */
 int
-ts_dimension_get_slice_ordinal(Dimension *dim, DimensionSlice *slice)
+ts_dimension_get_slice_ordinal(const Dimension *dim, const DimensionSlice *slice)
 {
 	Assert(NULL != dim);
 	Assert(NULL != slice);
@@ -588,7 +601,7 @@ ts_dimension_get_hypertable_id(int32 dimension_id)
 }
 
 DimensionVec *
-ts_dimension_get_slices(Dimension *dim)
+ts_dimension_get_slices(const Dimension *dim)
 {
 	return ts_dimension_slice_scan_by_dimension(dim->fd.id, 0);
 }
@@ -859,7 +872,7 @@ ts_dimension_set_number_of_slices(Dimension *dim, int16 num_slices)
  * the restype parameter.
  */
 Datum
-ts_dimension_transform_value(Dimension *dim, Oid collation, Datum value, Oid const_datum_type,
+ts_dimension_transform_value(const Dimension *dim, Oid collation, Datum value, Oid const_datum_type,
 							 Oid *restype)
 {
 	if (NULL != dim->partitioning)
@@ -890,14 +903,14 @@ point_create(int16 num_dimensions)
 }
 
 TSDLLEXPORT Point *
-ts_hyperspace_calculate_point(Hyperspace *hs, TupleTableSlot *slot)
+ts_hyperspace_calculate_point(const Hyperspace *hs, TupleTableSlot *slot)
 {
 	Point *p = point_create(hs->num_dimensions);
 	int i;
 
 	for (i = 0; i < hs->num_dimensions; i++)
 	{
-		Dimension *d = &hs->dimensions[i];
+		const Dimension *d = &hs->dimensions[i];
 		Datum datum;
 		bool isnull;
 		Oid dimtype;
@@ -1059,8 +1072,8 @@ dimension_add_not_null_on_column(Oid table_relid, char *colname)
 }
 
 void
-ts_dimension_update(Hypertable *ht, Name dimname, DimensionType dimtype, Datum *interval,
-					Oid *intervaltype, int16 *num_slices, Oid *integer_now_func)
+ts_dimension_update(const Hypertable *ht, const NameData *dimname, DimensionType dimtype,
+					Datum *interval, Oid *intervaltype, int16 *num_slices, Oid *integer_now_func)
 {
 	Dimension *dim;
 
@@ -1081,10 +1094,10 @@ ts_dimension_update(Hypertable *ht, Name dimname, DimensionType dimtype, Datum *
 							dimtype == DIMENSION_TYPE_OPEN ? "time" : "space"),
 					 errhint("An explicit dimension name must be specified.")));
 
-		dim = ts_hyperspace_get_dimension(ht->space, dimtype, 0);
+		dim = ts_hyperspace_get_mutable_dimension(ht->space, dimtype, 0);
 	}
 	else
-		dim = ts_hyperspace_get_dimension_by_name(ht->space, dimtype, NameStr(*dimname));
+		dim = ts_hyperspace_get_mutable_dimension_by_name(ht->space, dimtype, NameStr(*dimname));
 
 	if (NULL == dim)
 		ereport(ERROR,
@@ -1118,15 +1131,8 @@ ts_dimension_update(Hypertable *ht, Name dimname, DimensionType dimtype, Datum *
 	if (NULL != integer_now_func)
 	{
 		Oid pronamespace = get_func_namespace(*integer_now_func);
-		namecpy(&dim->fd.integer_now_func_schema,
-				DatumGetName(
-					DirectFunctionCall1(namein,
-										CStringGetDatum(get_namespace_name(pronamespace)))));
-
-		namecpy(&dim->fd.integer_now_func,
-				DatumGetName(
-					DirectFunctionCall1(namein,
-										CStringGetDatum(get_func_name(*integer_now_func)))));
+		namestrcpy(&dim->fd.integer_now_func_schema, get_namespace_name(pronamespace));
+		namestrcpy(&dim->fd.integer_now_func, get_func_name(*integer_now_func));
 	}
 
 	dimension_scan_update(dim->fd.id, dimension_tuple_update, dim, RowExclusiveLock);
@@ -1308,10 +1314,11 @@ dimension_info_validate_closed(DimensionInfo *info)
 void
 ts_dimension_info_validate(DimensionInfo *info)
 {
-	Dimension *dim;
+	const Dimension *dim;
 	HeapTuple tuple;
 	Datum datum;
 	bool isnull = false;
+	bool isgenerated;
 
 	if (!DIMENSION_INFO_IS_SET(info))
 		ereport(ERROR,
@@ -1340,22 +1347,16 @@ ts_dimension_info_validate(DimensionInfo *info)
 
 	info->set_not_null = !DatumGetBool(datum);
 
-	/* PG12 check that the column is not generated */
-#if PG12_GE
-	{
-		bool isgenerated;
+	/* check that the column is not generated */
+	datum = SysCacheGetAttr(ATTNAME, tuple, Anum_pg_attribute_attgenerated, &isnull);
+	Assert(!isnull);
+	isgenerated = (DatumGetChar(datum) == ATTRIBUTE_GENERATED_STORED);
 
-		datum = SysCacheGetAttr(ATTNAME, tuple, Anum_pg_attribute_attgenerated, &isnull);
-		Assert(!isnull);
-		isgenerated = (DatumGetChar(datum) == ATTRIBUTE_GENERATED_STORED);
-
-		if (isgenerated)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("invalid partitioning column"),
-					 errhint("Generated columns cannot be used as partitioning dimensions.")));
-	}
-#endif
+	if (isgenerated)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("invalid partitioning column"),
+				 errhint("Generated columns cannot be used as partitioning dimensions.")));
 
 	ReleaseSysCache(tuple);
 
@@ -1619,13 +1620,12 @@ dimension_rename_schema_name(TupleInfo *ti, void *data)
 
 /* Go through internal dimensions table and rename all relevant schema */
 void
-ts_dimensions_rename_schema_name(char *old_name, char *new_name)
+ts_dimensions_rename_schema_name(const char *old_name, const char *new_name)
 {
 	NameData old_schema_name;
 	ScanKeyData scankey[1];
 	Catalog *catalog = ts_catalog_get();
-	char *names[2] = { old_name, new_name };
-
+	char *names[2] = { (char *) old_name, (char *) new_name };
 	ScannerCtx scanctx = {
 		.table = catalog_get_table_id(catalog, DIMENSION),
 		.index = InvalidOid,
@@ -1663,7 +1663,7 @@ ts_dimensions_rename_schema_name(char *old_name, char *new_name)
  * a partitioning key.
  */
 List *
-ts_dimension_get_partexprs(Dimension *dim, Index hyper_varno)
+ts_dimension_get_partexprs(const Dimension *dim, Index hyper_varno)
 {
 	Expr *expr = NULL;
 	HeapTuple tuple;

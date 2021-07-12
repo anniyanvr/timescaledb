@@ -12,41 +12,38 @@
 #include <arpa/inet.h>
 
 #include <access/heapam.h>
-#include <access/sysattr.h>
 #include <access/hio.h>
+#include <access/sysattr.h>
 #include <access/xact.h>
 #include <commands/copy.h>
-#include <commands/trigger.h>
 #include <commands/tablecmds.h>
+#include <commands/trigger.h>
 #include <executor/executor.h>
 #include <executor/nodeModifyTable.h>
 #include <miscadmin.h>
 #include <nodes/makefuncs.h>
-#include <parser/parse_expr.h>
+#include <optimizer/optimizer.h>
 #include <parser/parse_coerce.h>
 #include <parser/parse_collate.h>
+#include <parser/parse_expr.h>
 #include <parser/parse_relation.h>
 #include <storage/bufmgr.h>
 #include <storage/smgr.h>
 #include <utils/builtins.h>
+#include <utils/elog.h>
 #include <utils/guc.h>
 #include <utils/lsyscache.h>
 #include <utils/rel.h>
-#include <utils/elog.h>
 #include <utils/rls.h>
 
 #include "hypertable.h"
 #include "copy.h"
 #include "dimension.h"
-#include "chunk_insert_state.h"
-#include "chunk_dispatch.h"
+#include "nodes/chunk_insert_state.h"
+#include "nodes/chunk_dispatch.h"
 #include "subspace_store.h"
 #include "compat.h"
 #include "cross_module_fn.h"
-
-#if PG12_GE
-#include <optimizer/optimizer.h>
-#endif
 
 /*
  * Copy from a file to a hypertable.
@@ -88,11 +85,7 @@ static bool
 next_copy_from(CopyChunkState *ccstate, ExprContext *econtext, Datum *values, bool *nulls)
 {
 	Assert(ccstate->cstate != NULL);
-#if PG12_GE
 	return NextCopyFrom(ccstate->cstate, econtext, values, nulls);
-#else
-	return NextCopyFrom(ccstate->cstate, econtext, values, nulls, NULL);
-#endif
 }
 
 /*
@@ -130,6 +123,13 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 {
 	ResultRelInfo *resultRelInfo;
 	ResultRelInfo *saved_resultRelInfo = NULL;
+	/* if copies are directed to a chunk that is compressed, we redirect
+	 * them to the internal compressed chunk. But we still
+	 * need to check triggers, constrainst etc. against the original
+	 * chunk (not the internal compressed chunk).
+	 * check_resultRelInfo saves that information
+	 */
+	ResultRelInfo *check_resultRelInfo = NULL;
 	EState *estate = ccstate->estate; /* for ExecConstraints() */
 	ExprContext *econtext;
 	TupleTableSlot *singleslot;
@@ -142,9 +142,7 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 	int ti_options = 0; /* start with default options for insert */
 	BulkInsertState bistate;
 	uint64 processed = 0;
-#if PG12_GE
 	ExprState *qualexpr = NULL;
-#endif
 
 	Assert(range_table);
 
@@ -243,30 +241,22 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 
 	ExecOpenIndices(resultRelInfo, false);
 
+#if PG14_LT
 	estate->es_result_relations = resultRelInfo;
 	estate->es_num_result_relations = 1;
+#endif
 	estate->es_result_relation_info = resultRelInfo;
 	estate->es_range_table = range_table;
 
-#if PG12_GE
 	ExecInitRangeTable(estate, estate->es_range_table);
-#else
-
-	/* Triggers might need a slot as well. In PG12, the trigger slots were
-	 * moved to the ResultRelInfo and are lazily initialized during
-	 * executor execution. */
-	estate->es_trig_tuple_slot = ExecInitExtraTupleSlotCompat(estate, NULL, NULL);
-#endif
 
 	singleslot = table_slot_create(resultRelInfo->ri_RelationDesc, &estate->es_tupleTable);
 
 	/* Prepare to catch AFTER triggers. */
 	AfterTriggerBeginQuery();
 
-#if PG12_GE
 	if (ccstate->where_clause)
 		qualexpr = ExecInitQual(castNode(List, ccstate->where_clause), NULL);
-#endif
 
 	/*
 	 * Check BEFORE STATEMENT insertion triggers. It's debatable whether we
@@ -336,14 +326,12 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 		if (NULL != cis->hyper_to_chunk_map)
 			myslot = execute_attr_map_slot(cis->hyper_to_chunk_map->attrMap, myslot, cis->slot);
 
-#if PG12_GE
 		if (qualexpr != NULL)
 		{
 			econtext->ecxt_scantuple = myslot;
 			if (!ExecQual(qualexpr, econtext))
 				continue;
 		}
-#endif
 
 		/*
 		 * Set the result relation in the executor state to the target chunk.
@@ -354,21 +342,21 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 		resultRelInfo = cis->result_relation_info;
 		estate->es_result_relation_info = resultRelInfo;
 
+		if (cis->compress_state != NULL)
+			check_resultRelInfo = cis->orig_result_relation_info;
+		else
+			check_resultRelInfo = resultRelInfo;
+
 		/* Set the right relation for triggers */
-		ts_tuptableslot_set_table_oid(myslot, RelationGetRelid(resultRelInfo->ri_RelationDesc));
+		ts_tuptableslot_set_table_oid(myslot,
+									  RelationGetRelid(check_resultRelInfo->ri_RelationDesc));
 
 		skip_tuple = false;
 
 		/* BEFORE ROW INSERT Triggers */
-		if (resultRelInfo->ri_TrigDesc && resultRelInfo->ri_TrigDesc->trig_insert_before_row)
-		{
-#if PG12_LT
-			myslot = ExecBRInsertTriggers(estate, resultRelInfo, myslot);
-			skip_tuple = (myslot == NULL);
-#else
-			skip_tuple = !ExecBRInsertTriggers(estate, resultRelInfo, myslot);
-#endif
-		}
+		if (check_resultRelInfo->ri_TrigDesc &&
+			check_resultRelInfo->ri_TrigDesc->trig_insert_before_row)
+			skip_tuple = !ExecBRInsertTriggers(estate, check_resultRelInfo, myslot);
 
 		if (!skip_tuple)
 		{
@@ -378,39 +366,53 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 			 */
 			List *recheckIndexes = NIL;
 
-#if PG12_GE
 			/* Compute stored generated columns */
-			if (resultRelInfo->ri_RelationDesc->rd_att->constr &&
-				resultRelInfo->ri_RelationDesc->rd_att->constr->has_generated_stored)
-#if PG13_GE
-				ExecComputeStoredGenerated(estate, myslot, CMD_INSERT);
-#else
-				ExecComputeStoredGenerated(estate, myslot);
-#endif
-#endif
+			if (check_resultRelInfo->ri_RelationDesc->rd_att->constr &&
+				check_resultRelInfo->ri_RelationDesc->rd_att->constr->has_generated_stored)
+				ExecComputeStoredGeneratedCompat(estate, myslot, CMD_INSERT);
+
 			/*
 			 * If the target is a plain table, check the constraints of
 			 * the tuple.
 			 */
-			if (resultRelInfo->ri_FdwRoutine == NULL &&
-				resultRelInfo->ri_RelationDesc->rd_att->constr)
+			if (check_resultRelInfo->ri_FdwRoutine == NULL &&
+				check_resultRelInfo->ri_RelationDesc->rd_att->constr)
 			{
-				Assert(resultRelInfo->ri_RangeTableIndex > 0 && estate->es_range_table);
-				ExecConstraints(resultRelInfo, myslot, estate);
+				Assert(check_resultRelInfo->ri_RangeTableIndex > 0 && estate->es_range_table);
+				ExecConstraints(check_resultRelInfo, myslot, estate);
 			}
 
-			/* OK, store the tuple and create index entries for it */
-			table_tuple_insert(resultRelInfo->ri_RelationDesc, myslot, mycid, ti_options, bistate);
+			if (cis->compress_state)
+			{
+				TupleTableSlot *compress_slot =
+					ts_cm_functions->compress_row_exec(cis->compress_state, myslot);
+				table_tuple_insert(resultRelInfo->ri_RelationDesc,
+								   compress_slot,
+								   mycid,
+								   ti_options,
+								   bistate);
+				if (resultRelInfo->ri_NumIndices > 0)
+					recheckIndexes = ExecInsertIndexTuples(compress_slot, estate, false, NULL, NIL);
+			}
+			else
+			{
+				/* OK, store the tuple and create index entries for it */
+				table_tuple_insert(resultRelInfo->ri_RelationDesc,
+								   myslot,
+								   mycid,
+								   ti_options,
+								   bistate);
 
-			if (resultRelInfo->ri_NumIndices > 0)
-				recheckIndexes = ExecInsertIndexTuplesCompat(myslot, estate, false, NULL, NIL);
+				if (resultRelInfo->ri_NumIndices > 0)
+					recheckIndexes = ExecInsertIndexTuples(myslot, estate, false, NULL, NIL);
+			}
 
 			/* AFTER ROW INSERT Triggers */
-			ExecARInsertTriggersCompat(estate,
-									   resultRelInfo,
-									   myslot,
-									   recheckIndexes,
-									   NULL /* transition capture */);
+			ExecARInsertTriggers(estate,
+								 check_resultRelInfo,
+								 myslot,
+								 recheckIndexes,
+								 NULL /* transition capture */);
 
 			list_free(recheckIndexes);
 
@@ -446,7 +448,12 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 
 	ExecCloseIndices(resultRelInfo);
 	/* Close any trigger target relations */
+#if PG14_LT
 	ExecCleanUpTriggerState(estate);
+#else
+	ExecCloseResultRelations(estate);
+	ExecCloseRangeTableRelations(estate);
+#endif
 
 	/*
 	 * If we skipped writing WAL, then we need to sync the heap (but not
@@ -552,12 +559,10 @@ copy_constraints_and_check(ParseState *pstate, Relation rel, List *attnums)
 		addRangeTableEntryForRelation(pstate, rel, RowExclusiveLock, NULL, false, false);
 	RangeTblEntry *rte = nsitem->p_rte;
 	addNSItemToQuery(pstate, nsitem, true, true, true);
-#elif PG12
+#else
 	RangeTblEntry *rte =
 		addRangeTableEntryForRelation(pstate, rel, RowExclusiveLock, NULL, false, false);
 	addRTEtoQuery(pstate, rte, false, true, true);
-#else
-	RangeTblEntry *rte = addRangeTableEntryForRelation(pstate, rel, NULL, false, false);
 #endif
 	rte->requiredPerms = ACL_INSERT;
 
@@ -654,7 +659,6 @@ timescaledb_DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *proces
 						   stmt->attlist,
 						   stmt->options);
 
-#if PG12_GE
 	if (stmt->whereClause)
 	{
 		if (hypertable_is_distributed(ht))
@@ -672,7 +676,6 @@ timescaledb_DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *proces
 		where_clause = (Node *) canonicalize_qual((Expr *) where_clause, false);
 		where_clause = (Node *) make_ands_implicit((Expr *) where_clause);
 	}
-#endif
 
 	ccstate = copy_chunk_state_create(ht, rel, next_copy_from, cstate, NULL);
 	ccstate->where_clause = where_clause;

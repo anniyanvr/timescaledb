@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: ["12.6", "13.2"]
+        pg: ["12.7", "13.3"]
         os: [ubuntu-20.04]
     env:
       PG_SRC_DIR: pgbuild
@@ -21,7 +21,7 @@ jobs:
       MAKE_JOBS: 4
     steps:
     - name: Install Dependencies
-      run: sudo apt install flex bison
+      run: sudo apt install flex bison clang-9 llvm-9 llvm-9-dev llvm-9-tools
 
     # this workflow depends on the cached postgres build from the main regression
     # workflow since that workflow runs daily there should always be a cache hit
@@ -55,7 +55,7 @@ jobs:
     - name: Build TimescaleDB
       run: |
         PATH="$GITHUB_WORKSPACE/coverity/bin:$PATH"
-        ./bootstrap -DCMAKE_BUILD_TYPE=Release -DPG_SOURCE_DIR=~/$PG_SRC_DIR -DPG_PATH=~/$PG_INSTALL_DIR
+        ./bootstrap -DCMAKE_BUILD_TYPE=Release -DPG_SOURCE_DIR=~/$PG_SRC_DIR -DPG_PATH=~/$PG_INSTALL_DIR -DTAP_CHECKS=off
         cov-build --dir cov-int make -C build
 
     - name: Upload report

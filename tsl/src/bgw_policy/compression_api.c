@@ -37,8 +37,20 @@
 	DatumGetIntervalP(DirectFunctionCall3(interval_in, CStringGetDatum("1 hour"), InvalidOid, -1))
 
 #define POLICY_COMPRESSION_PROC_NAME "policy_compression"
+#define POLICY_RECOMPRESSION_PROC_NAME "policy_recompression"
 #define CONFIG_KEY_HYPERTABLE_ID "hypertable_id"
 #define CONFIG_KEY_COMPRESS_AFTER "compress_after"
+#define CONFIG_KEY_RECOMPRESS_AFTER "recompress_after"
+#define CONFIG_KEY_RECOMPRESS "recompress"
+
+bool
+policy_compression_get_recompress(const Jsonb *config)
+{
+	bool found;
+	bool recompress = ts_jsonb_get_bool_field(config, CONFIG_KEY_RECOMPRESS, &found);
+
+	return found ? recompress : true;
+}
 
 int32
 policy_compression_get_hypertable_id(const Jsonb *config)
@@ -58,14 +70,14 @@ int64
 policy_compression_get_compress_after_int(const Jsonb *config)
 {
 	bool found;
-	int32 hypertable_id = ts_jsonb_get_int64_field(config, CONFIG_KEY_COMPRESS_AFTER, &found);
+	int64 compress_after = ts_jsonb_get_int64_field(config, CONFIG_KEY_COMPRESS_AFTER, &found);
 
 	if (!found)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("could not find %s in config for job", CONFIG_KEY_COMPRESS_AFTER)));
 
-	return hypertable_id;
+	return compress_after;
 }
 
 Interval *
@@ -77,6 +89,33 @@ policy_compression_get_compress_after_interval(const Jsonb *config)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("could not find %s in config for job", CONFIG_KEY_COMPRESS_AFTER)));
+
+	return interval;
+}
+
+int64
+policy_recompression_get_recompress_after_int(const Jsonb *config)
+{
+	bool found;
+	int64 compress_after = ts_jsonb_get_int64_field(config, CONFIG_KEY_RECOMPRESS_AFTER, &found);
+
+	if (!found)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not find %s in config for job", CONFIG_KEY_RECOMPRESS_AFTER)));
+
+	return compress_after;
+}
+
+Interval *
+policy_recompression_get_recompress_after_interval(const Jsonb *config)
+{
+	Interval *interval = ts_jsonb_get_interval_field(config, CONFIG_KEY_RECOMPRESS_AFTER);
+
+	if (interval == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not find %s in config for job", CONFIG_KEY_RECOMPRESS_AFTER)));
 
 	return interval;
 }
@@ -95,10 +134,22 @@ policy_compression_proc(PG_FUNCTION_ARGS)
 }
 
 Datum
+policy_recompression_proc(PG_FUNCTION_ARGS)
+{
+	if (PG_NARGS() != 2 || PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		PG_RETURN_VOID();
+
+	TS_PREVENT_FUNC_IF_READ_ONLY();
+
+	policy_recompression_execute(PG_GETARG_INT32(0), PG_GETARG_JSONB_P(1));
+
+	PG_RETURN_VOID();
+}
+
+Datum
 policy_compression_add(PG_FUNCTION_ARGS)
 {
 	NameData application_name;
-	NameData compress_chunks_name;
 	NameData proc_name, proc_schema, owner;
 	int32 job_id;
 	Oid ht_oid = PG_GETARG_OID(0);
@@ -108,18 +159,13 @@ policy_compression_add(PG_FUNCTION_ARGS)
 	Interval *default_schedule_interval = DEFAULT_SCHEDULE_INTERVAL;
 	Hypertable *hypertable;
 	Cache *hcache;
-	Dimension *dim;
+	const Dimension *dim;
 	Oid owner_id;
 
 	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	/* check if this is a table with compression enabled */
 	hypertable = ts_hypertable_cache_get_cache_and_entry(ht_oid, CACHE_FLAG_NONE, &hcache);
-
-	if (hypertable_is_distributed(hypertable))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("compression policies not supported on distributed hypertables")));
 
 	if (!TS_HYPERTABLE_HAS_COMPRESSION_ENABLED(hypertable))
 	{
@@ -187,7 +233,6 @@ policy_compression_add(PG_FUNCTION_ARGS)
 
 	/* insert a new job into jobs table */
 	namestrcpy(&application_name, "Compression Policy");
-	namestrcpy(&compress_chunks_name, "compress_chunks");
 	namestrcpy(&proc_name, POLICY_COMPRESSION_PROC_NAME);
 	namestrcpy(&proc_schema, INTERNAL_SCHEMA_NAME);
 	namestrcpy(&owner, GetUserNameFromId(owner_id, false));
@@ -231,7 +276,6 @@ policy_compression_add(PG_FUNCTION_ARGS)
 	Jsonb *config = JsonbValueToJsonb(result);
 
 	job_id = ts_bgw_job_insert_relation(&application_name,
-										&compress_chunks_name,
 										default_schedule_interval,
 										DEFAULT_MAX_RUNTIME,
 										DEFAULT_MAX_RETRIES,

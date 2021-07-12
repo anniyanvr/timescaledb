@@ -20,6 +20,7 @@
 #include <utils/syscache.h>
 #include <utils/snapmgr.h>
 #include <utils/timestamp.h>
+#include <extension.h>
 
 #include "bgw/timer.h"
 #include "bgw/job.h"
@@ -82,8 +83,8 @@ enable_fast_restart(int32 job_id, const char *job_name)
 static int
 get_chunk_id_to_reorder(int32 job_id, Hypertable *ht)
 {
-	Dimension *time_dimension = hyperspace_get_open_dimension(ht->space, 0);
-	DimensionSlice *nth_dimension =
+	const Dimension *time_dimension = hyperspace_get_open_dimension(ht->space, 0);
+	const DimensionSlice *nth_dimension =
 		ts_dimension_slice_nth_latest_slice(time_dimension->fd.id,
 											REORDER_SKIP_RECENT_DIM_SLICES_N);
 
@@ -131,6 +132,7 @@ get_chunk_to_compress(const Dimension *dim, const Jsonb *config)
 {
 	Oid partitioning_type = ts_dimension_get_partition_type(dim);
 	StrategyNumber end_strategy = BTLessStrategyNumber;
+	bool recompress = policy_compression_get_recompress(config);
 
 	Datum boundary = get_window_boundary(dim,
 										 config,
@@ -142,7 +144,30 @@ get_chunk_to_compress(const Dimension *dim, const Jsonb *config)
 													  -1,			   /*start_value*/
 													  end_strategy,
 													  ts_time_value_to_internal(boundary,
-																				partitioning_type));
+																				partitioning_type),
+													  true,
+													  recompress);
+}
+
+static int32
+get_chunk_to_recompress(const Dimension *dim, const Jsonb *config)
+{
+	Oid partitioning_type = ts_dimension_get_partition_type(dim);
+	StrategyNumber end_strategy = BTLessStrategyNumber;
+
+	Datum boundary = get_window_boundary(dim,
+										 config,
+										 policy_recompression_get_recompress_after_int,
+										 policy_recompression_get_recompress_after_interval);
+
+	return ts_dimension_slice_get_chunkid_to_compress(dim->fd.id,
+													  InvalidStrategy, /*start_strategy*/
+													  -1,			   /*start_value*/
+													  end_strategy,
+													  ts_time_value_to_internal(boundary,
+																				partitioning_type),
+													  false,
+													  true);
 }
 
 static void
@@ -237,11 +262,11 @@ policy_reorder_read_and_validate_config(Jsonb *config, PolicyReorderData *policy
 	}
 }
 
-static Dimension *
-get_open_dimension_for_hypertable(Hypertable *ht)
+static const Dimension *
+get_open_dimension_for_hypertable(const Hypertable *ht)
 {
 	int32 mat_id = ht->fd.id;
-	Dimension *open_dim = hyperspace_get_open_dimension(ht->space, 0);
+	const Dimension *open_dim = hyperspace_get_open_dimension(ht->space, 0);
 	Oid partitioning_type = ts_dimension_get_partition_type(open_dim);
 	if (IS_INTEGER_TYPE(partitioning_type))
 	{
@@ -281,7 +306,7 @@ policy_retention_read_and_validate_config(Jsonb *config, PolicyRetentionData *po
 	Oid object_relid;
 	Hypertable *hypertable;
 	Cache *hcache;
-	Dimension *open_dim;
+	const Dimension *open_dim;
 	Datum boundary;
 	Datum boundary_type;
 	ContinuousAgg *cagg;
@@ -335,7 +360,7 @@ policy_refresh_cagg_read_and_validate_config(Jsonb *config, PolicyContinuousAggD
 {
 	int32 materialization_id;
 	Hypertable *mat_ht;
-	Dimension *open_dim;
+	const Dimension *open_dim;
 	Oid dim_type;
 	int64 refresh_start, refresh_end;
 
@@ -371,11 +396,125 @@ policy_refresh_cagg_read_and_validate_config(Jsonb *config, PolicyContinuousAggD
 	}
 }
 
+/*
+ * Invoke compress_chunk via fmgr so that the call can be deparsed and sent to
+ * remote data nodes.
+ */
+static void
+policy_invoke_compress_chunk(Chunk *chunk)
+{
+	EState *estate;
+	ExprContext *econtext;
+	FuncExpr *fexpr;
+	Oid relid = chunk->table_id;
+	Oid restype;
+	Oid func_oid;
+	List *args = NIL;
+	int i;
+	bool isnull;
+	Const *argarr[COMPRESS_CHUNK_NARGS] = {
+		makeConst(REGCLASSOID,
+				  -1,
+				  InvalidOid,
+				  sizeof(relid),
+				  ObjectIdGetDatum(relid),
+				  false,
+				  false),
+		castNode(Const, makeBoolConst(true, false)),
+	};
+	Oid type_id[COMPRESS_CHUNK_NARGS] = { REGCLASSOID, BOOLOID };
+	char *schema_name = ts_extension_schema_name();
+	List *fqn = list_make2(makeString(schema_name), makeString(COMPRESS_CHUNK_FUNCNAME));
+
+	StaticAssertStmt(lengthof(type_id) == lengthof(argarr),
+					 "argarr and type_id should have matching lengths");
+
+	func_oid = LookupFuncName(fqn, lengthof(type_id), type_id, false);
+	Assert(func_oid); /* LookupFuncName should not return an invalid OID */
+
+	/* Prepare the function expr with argument list */
+	get_func_result_type(func_oid, &restype, NULL);
+
+	for (i = 0; i < lengthof(argarr); i++)
+		args = lappend(args, argarr[i]);
+
+	fexpr = makeFuncExpr(func_oid, restype, args, InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	fexpr->funcretset = false;
+
+	estate = CreateExecutorState();
+	econtext = CreateExprContext(estate);
+
+	ExprState *exprstate = ExecInitExpr(&fexpr->xpr, NULL);
+
+	ExecEvalExprSwitchContext(exprstate, econtext, &isnull);
+
+	/* Cleanup */
+	FreeExprContext(econtext, false);
+	FreeExecutorState(estate);
+}
+
+/*
+ * Invoke recompress_chunk via fmgr so that the call can be deparsed and sent to
+ * remote data nodes.
+ */
+static void
+policy_invoke_recompress_chunk(Chunk *chunk)
+{
+	EState *estate;
+	ExprContext *econtext;
+	FuncExpr *fexpr;
+	Oid relid = chunk->table_id;
+	Oid restype;
+	Oid func_oid;
+	List *args = NIL;
+	int i;
+	bool isnull;
+	Const *argarr[RECOMPRESS_CHUNK_NARGS] = {
+		makeConst(REGCLASSOID,
+				  -1,
+				  InvalidOid,
+				  sizeof(relid),
+				  ObjectIdGetDatum(relid),
+				  false,
+				  false),
+		castNode(Const, makeBoolConst(true, false)),
+	};
+	Oid type_id[RECOMPRESS_CHUNK_NARGS] = { REGCLASSOID, BOOLOID };
+	char *schema_name = ts_extension_schema_name();
+	List *fqn = list_make2(makeString(schema_name), makeString(RECOMPRESS_CHUNK_FUNCNAME));
+
+	StaticAssertStmt(lengthof(type_id) == lengthof(argarr),
+					 "argarr and type_id should have matching lengths");
+
+	func_oid = LookupFuncName(fqn, lengthof(type_id), type_id, false);
+	Assert(func_oid); /* LookupFuncName should not return an invalid OID */
+
+	/* Prepare the function expr with argument list */
+	get_func_result_type(func_oid, &restype, NULL);
+
+	for (i = 0; i < lengthof(argarr); i++)
+		args = lappend(args, argarr[i]);
+
+	fexpr = makeFuncExpr(func_oid, restype, args, InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	fexpr->funcretset = false;
+
+	estate = CreateExecutorState();
+	econtext = CreateExprContext(estate);
+
+	ExprState *exprstate = ExecInitExpr(&fexpr->xpr, NULL);
+
+	ExecEvalExprSwitchContext(exprstate, econtext, &isnull);
+
+	/* Cleanup */
+	FreeExprContext(econtext, false);
+	FreeExecutorState(estate);
+}
+
 bool
 policy_compression_execute(int32 job_id, Jsonb *config)
 {
 	int32 chunkid;
-	Dimension *dim;
+	const Dimension *dim;
 	PolicyCompressionData policy_data;
 
 	policy_compression_read_and_validate_config(config, &policy_data);
@@ -391,8 +530,20 @@ policy_compression_execute(int32 job_id, Jsonb *config)
 	if (chunkid != INVALID_CHUNK_ID)
 	{
 		Chunk *chunk = ts_chunk_get_by_id(chunkid, true);
-		tsl_compress_chunk_wrapper(chunk, false);
-
+		if (hypertable_is_distributed(policy_data.hypertable))
+		{
+			if (ts_chunk_is_unordered(chunk))
+				policy_invoke_recompress_chunk(chunk);
+			else
+				policy_invoke_compress_chunk(chunk);
+		}
+		else
+		{
+			if (ts_chunk_is_unordered(chunk))
+				tsl_recompress_chunk_wrapper(chunk);
+			else
+				tsl_compress_chunk_wrapper(chunk, true);
+		}
 		elog(LOG,
 			 "completed compressing chunk %s.%s",
 			 NameStr(chunk->fd.schema_name),
@@ -424,6 +575,61 @@ policy_compression_read_and_validate_config(Jsonb *config, PolicyCompressionData
 	}
 }
 
+void
+policy_recompression_read_and_validate_config(Jsonb *config, PolicyCompressionData *policy_data)
+{
+	Oid table_relid = ts_hypertable_id_to_relid(policy_compression_get_hypertable_id(config));
+	Cache *hcache;
+	Hypertable *hypertable =
+		ts_hypertable_cache_get_cache_and_entry(table_relid, CACHE_FLAG_NONE, &hcache);
+	if (policy_data)
+	{
+		policy_data->hypertable = hypertable;
+		policy_data->hcache = hcache;
+	}
+}
+
+bool
+policy_recompression_execute(int32 job_id, Jsonb *config)
+{
+	int32 chunkid;
+	const Dimension *dim;
+	PolicyCompressionData policy_data;
+
+	policy_recompression_read_and_validate_config(config, &policy_data);
+	dim = hyperspace_get_open_dimension(policy_data.hypertable->space, 0);
+	chunkid = get_chunk_to_recompress(dim, config);
+
+	if (chunkid == INVALID_CHUNK_ID)
+		elog(NOTICE,
+			 "no chunks for hypertable \"%s.%s\" that satisfy recompress chunk policy",
+			 policy_data.hypertable->fd.schema_name.data,
+			 policy_data.hypertable->fd.table_name.data);
+
+	if (chunkid != INVALID_CHUNK_ID)
+	{
+		Chunk *chunk = ts_chunk_get_by_id(chunkid, true);
+		if (hypertable_is_distributed(policy_data.hypertable))
+			policy_invoke_recompress_chunk(chunk);
+		else
+			tsl_recompress_chunk_wrapper(chunk);
+
+		elog(LOG,
+			 "completed recompressing chunk \"%s.%s\"",
+			 NameStr(chunk->fd.schema_name),
+			 NameStr(chunk->fd.table_name));
+	}
+
+	chunkid = get_chunk_to_recompress(dim, config);
+	if (chunkid != INVALID_CHUNK_ID)
+		enable_fast_restart(job_id, "recompression");
+
+	ts_cache_release(policy_data.hcache);
+
+	elog(DEBUG1, "job %d completed recompressing chunk", job_id);
+	return true;
+}
+
 static void
 job_execute_function(FuncExpr *funcexpr)
 {
@@ -446,11 +652,7 @@ job_execute_procedure(FuncExpr *funcexpr)
 	call->funcexpr = funcexpr;
 	DestReceiver *dest = CreateDestReceiver(DestNone);
 	/* we don't need to create proper param list cause we pass in all arguments as Const */
-#ifdef PG11
-	ParamListInfo params = palloc0(offsetof(ParamListInfoData, params));
-#else
 	ParamListInfo params = makeParamList(0);
-#endif
 	ExecuteCallStmt(call, params, false, dest);
 }
 
